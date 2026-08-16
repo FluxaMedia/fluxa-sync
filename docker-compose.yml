@@ -7,6 +7,7 @@ services:
       DATABASE_URL: postgresql://fluxa:fluxa@postgres:5432/fluxa_sync
       JWT_SECRET: change-this-to-a-long-random-secret
       RUST_LOG: info
+      SYNC_EVENT_RETENTION_DAYS: 90
     depends_on:
       postgres:
         condition: service_healthy
@@ -25,4 +26,3 @@ services:
       retries: 10
 volumes:
   postgres-data:
-

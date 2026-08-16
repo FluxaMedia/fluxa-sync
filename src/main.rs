@@ -75,6 +75,14 @@ struct SyncQuery {
     since: Option<i64>,
 }
 
+async fn compact_events(db: &PgPool, retention_days: i32) {
+    let result = sqlx::query("delete from sync_events where created_at < now() - ($1::double precision * interval '1 day')")
+        .bind(retention_days.max(1)).execute(db).await;
+    if let Ok(result) = result {
+        if result.rows_affected() > 0 { tracing::info!(removed = result.rows_affected(), retention_days, "compacted sync events"); }
+    }
+}
+
 struct ApiError(StatusCode, String);
 
 impl ApiError {
@@ -194,18 +202,22 @@ async fn snapshot(State(state): State<AppState>, headers: HeaderMap, Query(query
     let rows = sqlx::query("select entity_type, document_key, payload, deleted, revision, updated_at from sync_documents where profile_id = $1 order by revision")
         .bind(query.profile_id).fetch_all(&state.db).await.map_err(ApiError::internal)?;
     let documents = rows.into_iter().map(|row| json!({"entity_type": row.try_get::<String, _>("entity_type").unwrap_or_default(), "key": row.try_get::<String, _>("document_key").unwrap_or_default(), "payload": row.try_get::<Value, _>("payload").unwrap_or(Value::Null), "deleted": row.try_get::<bool, _>("deleted").unwrap_or(false), "revision": row.try_get::<i64, _>("revision").unwrap_or_default(), "updated_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at").unwrap_or_else(|_| chrono::Utc::now())})).collect::<Vec<_>>();
-    Ok(Json(json!({"profile_id": query.profile_id, "documents": documents})))
+    let cursor = sqlx::query("select sync_revision from profiles where id = $1").bind(query.profile_id).fetch_one(&state.db).await.map_err(ApiError::internal)?.try_get::<i64, _>("sync_revision").map_err(ApiError::internal)?;
+    Ok(Json(json!({"profile_id": query.profile_id, "cursor": cursor, "documents": documents})))
 }
 
 async fn pull(State(state): State<AppState>, headers: HeaderMap, Query(query): Query<SyncQuery>) -> Result<Json<Value>, ApiError> {
     let user_id = authenticated_user(&headers, &state.jwt_secret)?;
     owns_profile(&state, user_id, query.profile_id).await?;
     let since = query.since.unwrap_or(0);
+    let current_revision = sqlx::query("select sync_revision from profiles where id = $1").bind(query.profile_id).fetch_one(&state.db).await.map_err(ApiError::internal)?.try_get::<i64, _>("sync_revision").map_err(ApiError::internal)?;
+    let minimum = sqlx::query("select min(revision) as revision from sync_events where profile_id = $1").bind(query.profile_id).fetch_one(&state.db).await.map_err(ApiError::internal)?.try_get::<Option<i64>, _>("revision").map_err(ApiError::internal)?;
+    let reset_required = since > 0 && match minimum { Some(revision) => since < revision - 1, None => since < current_revision };
     let rows = sqlx::query("select entity_type, document_key, payload, deleted, revision, created_at from sync_events where profile_id = $1 and revision > $2 order by revision")
         .bind(query.profile_id).bind(since).fetch_all(&state.db).await.map_err(ApiError::internal)?;
     let changes = rows.into_iter().map(|row| json!({"entity_type": row.try_get::<String, _>("entity_type").unwrap_or_default(), "key": row.try_get::<String, _>("document_key").unwrap_or_default(), "payload": row.try_get::<Value, _>("payload").unwrap_or(Value::Null), "revision": row.try_get::<i64, _>("revision").unwrap_or_default(), "deleted": row.try_get::<bool, _>("deleted").unwrap_or(false), "updated_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at").unwrap_or_else(|_| chrono::Utc::now())})).collect::<Vec<_>>();
-    let cursor = changes.last().and_then(|item| item.get("revision")).cloned().unwrap_or(json!(since));
-    Ok(Json(json!({"profile_id": query.profile_id, "since": since, "cursor": cursor, "changes": changes})))
+    let cursor = json!(current_revision);
+    Ok(Json(json!({"profile_id": query.profile_id, "since": since, "cursor": cursor, "minimum_available_revision": minimum, "reset_required": reset_required, "changes": changes})))
 }
 
 async fn push(State(state): State<AppState>, headers: HeaderMap, Json(input): Json<PushRequest>) -> Result<Json<Value>, ApiError> {
@@ -273,6 +285,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     sqlx::migrate!().run(&db).await?;
     let (events, _) = broadcast::channel(256);
     let state = AppState { db, jwt_secret: Arc::new(jwt_secret), events };
+    let retention_days = env::var("SYNC_EVENT_RETENTION_DAYS").ok().and_then(|value| value.parse::<i32>().ok()).unwrap_or(90).max(1);
+    let compaction_db = state.db.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+        loop {
+            interval.tick().await;
+            compact_events(&compaction_db, retention_days).await;
+        }
+    });
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/v1/auth/register", post(register))

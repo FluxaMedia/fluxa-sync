@@ -43,6 +43,8 @@ Authentication uses bearer JWT access tokens and rotating one-time refresh token
 
 Push changes may include `expected_revision`. When another device has already changed that document, the server leaves the incoming change unapplied and returns it in `conflicts` with both revisions. The client can then merge the JSON payload and retry.
 
+Event history is compacted automatically according to `SYNC_EVENT_RETENTION_DAYS` (90 by default). A pull response includes `minimum_available_revision` and `reset_required`. If `reset_required` is true, download `/sync/snapshot`, replace the local state, and continue from the snapshot cursor.
+
 The realtime endpoint is a WebSocket event channel. It broadcasts committed profile changes; clients still use `/sync/pull` as the durable source of truth after reconnects.
 
 ## Backups

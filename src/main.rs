@@ -1,17 +1,20 @@
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
-use axum::{Json, Router, extract::{Query, State}, http::{HeaderMap, StatusCode}, response::{IntoResponse, Response}, routing::{get, post}};
+use axum::{Json, Router, extract::{Query, State, WebSocketUpgrade, ws::Message}, http::{HeaderMap, StatusCode}, response::{IntoResponse, Response}, routing::{get, patch, post}};
+use futures_util::{SinkExt, StreamExt};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 use std::{env, net::SocketAddr, sync::Arc};
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 #[derive(Clone)]
 struct AppState {
     db: PgPool,
     jwt_secret: Arc<String>,
+    events: broadcast::Sender<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -45,6 +48,13 @@ struct CreateProfile {
 }
 
 #[derive(Deserialize)]
+struct UpdateProfile {
+    name: Option<String>,
+    avatar: Option<String>,
+    settings: Option<Value>,
+}
+
+#[derive(Deserialize)]
 struct PushRequest {
     profile_id: Uuid,
     changes: Vec<SyncChange>,
@@ -56,6 +66,7 @@ struct SyncChange {
     key: String,
     payload: Option<Value>,
     deleted: Option<bool>,
+    expected_revision: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -156,6 +167,22 @@ async fn create_profile(State(state): State<AppState>, headers: HeaderMap, Json(
     Ok(Json(json!({"id": row.try_get::<Uuid, _>("id").map_err(ApiError::internal)?, "name": row.try_get::<String, _>("name").map_err(ApiError::internal)?, "avatar": row.try_get::<Option<String>, _>("avatar").map_err(ApiError::internal)?, "settings": row.try_get::<Value, _>("settings").map_err(ApiError::internal)?, "updated_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at").map_err(ApiError::internal)?})))
 }
 
+async fn update_profile(State(state): State<AppState>, headers: HeaderMap, axum::extract::Path(profile_id): axum::extract::Path<Uuid>, Json(input): Json<UpdateProfile>) -> Result<Json<Value>, ApiError> {
+    let user_id = authenticated_user(&headers, &state.jwt_secret)?;
+    owns_profile(&state, user_id, profile_id).await?;
+    let row = sqlx::query("update profiles set name = coalesce($2, name), avatar = coalesce($3, avatar), settings = coalesce($4, settings), updated_at = now() where id = $1 returning id, name, avatar, settings, updated_at")
+        .bind(profile_id).bind(input.name).bind(input.avatar).bind(input.settings).fetch_one(&state.db).await.map_err(ApiError::internal)?;
+    Ok(Json(json!({"id": row.try_get::<Uuid, _>("id").map_err(ApiError::internal)?, "name": row.try_get::<String, _>("name").map_err(ApiError::internal)?, "avatar": row.try_get::<Option<String>, _>("avatar").map_err(ApiError::internal)?, "settings": row.try_get::<Value, _>("settings").map_err(ApiError::internal)?, "updated_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at").map_err(ApiError::internal)?})))
+}
+
+async fn delete_profile(State(state): State<AppState>, headers: HeaderMap, axum::extract::Path(profile_id): axum::extract::Path<Uuid>) -> Result<StatusCode, ApiError> {
+    let user_id = authenticated_user(&headers, &state.jwt_secret)?;
+    owns_profile(&state, user_id, profile_id).await?;
+    let count = sqlx::query("delete from profiles where id = $1 and user_id = $2").bind(profile_id).bind(user_id).execute(&state.db).await.map_err(ApiError::internal)?.rows_affected();
+    if count == 0 { return Err(ApiError::bad_request("profile not found")); }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn owns_profile(state: &AppState, user_id: Uuid, profile_id: Uuid) -> Result<(), ApiError> {
     let exists = sqlx::query("select 1 from profiles where id = $1 and user_id = $2").bind(profile_id).bind(user_id).fetch_optional(&state.db).await.map_err(ApiError::internal)?.is_some();
     if exists { Ok(()) } else { Err(ApiError::unauthorized()) }
@@ -174,9 +201,9 @@ async fn pull(State(state): State<AppState>, headers: HeaderMap, Query(query): Q
     let user_id = authenticated_user(&headers, &state.jwt_secret)?;
     owns_profile(&state, user_id, query.profile_id).await?;
     let since = query.since.unwrap_or(0);
-    let rows = sqlx::query("select entity_type, document_key, payload, deleted, revision, updated_at from sync_documents where profile_id = $1 and revision > $2 order by revision")
+    let rows = sqlx::query("select entity_type, document_key, payload, deleted, revision, created_at from sync_events where profile_id = $1 and revision > $2 order by revision")
         .bind(query.profile_id).bind(since).fetch_all(&state.db).await.map_err(ApiError::internal)?;
-    let changes = rows.into_iter().map(|row| json!({"entity_type": row.try_get::<String, _>("entity_type").unwrap_or_default(), "key": row.try_get::<String, _>("document_key").unwrap_or_default(), "payload": row.try_get::<Value, _>("payload").unwrap_or(Value::Null), "revision": row.try_get::<i64, _>("revision").unwrap_or_default(), "deleted": row.try_get::<bool, _>("deleted").unwrap_or(false), "updated_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at").unwrap_or_else(|_| chrono::Utc::now())})).collect::<Vec<_>>();
+    let changes = rows.into_iter().map(|row| json!({"entity_type": row.try_get::<String, _>("entity_type").unwrap_or_default(), "key": row.try_get::<String, _>("document_key").unwrap_or_default(), "payload": row.try_get::<Value, _>("payload").unwrap_or(Value::Null), "revision": row.try_get::<i64, _>("revision").unwrap_or_default(), "deleted": row.try_get::<bool, _>("deleted").unwrap_or(false), "updated_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at").unwrap_or_else(|_| chrono::Utc::now())})).collect::<Vec<_>>();
     let cursor = changes.last().and_then(|item| item.get("revision")).cloned().unwrap_or(json!(since));
     Ok(Json(json!({"profile_id": query.profile_id, "since": since, "cursor": cursor, "changes": changes})))
 }
@@ -186,15 +213,54 @@ async fn push(State(state): State<AppState>, headers: HeaderMap, Json(input): Js
     owns_profile(&state, user_id, input.profile_id).await?;
     let mut transaction = state.db.begin().await.map_err(ApiError::internal)?;
     let mut applied = Vec::new();
+    let mut conflicts = Vec::new();
+    let current_revision: i64 = sqlx::query("select sync_revision from profiles where id = $1 for update").bind(input.profile_id).fetch_one(&mut *transaction).await.map_err(ApiError::internal)?.try_get("sync_revision").map_err(ApiError::internal)?;
     for change in input.changes {
         if change.entity_type.trim().is_empty() || change.key.trim().is_empty() { return Err(ApiError::bad_request("entity_type and key are required")); }
         let payload = change.payload.unwrap_or(Value::Null);
-        let row = sqlx::query("insert into sync_documents (profile_id, document_type, document_key, payload, deleted, revision) values ($1, $2, $3, $4, $5, 1) on conflict (profile_id, document_type, document_key) do update set payload = excluded.payload, deleted = excluded.deleted, revision = sync_documents.revision + 1, updated_at = now() returning revision, updated_at")
-            .bind(input.profile_id).bind(change.entity_type).bind(change.key).bind(payload).bind(change.deleted.unwrap_or(false)).fetch_one(&mut *transaction).await.map_err(ApiError::internal)?;
-        applied.push(json!({"revision": row.try_get::<i64, _>("revision").map_err(ApiError::internal)?, "updated_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at").map_err(ApiError::internal)?}));
+        if let Some(expected) = change.expected_revision {
+            let actual = sqlx::query("select revision from sync_documents where profile_id = $1 and document_type = $2 and document_key = $3")
+                .bind(input.profile_id).bind(&change.entity_type).bind(&change.key).fetch_optional(&mut *transaction).await.map_err(ApiError::internal)?
+                .map(|row| row.try_get::<i64, _>("revision").unwrap_or(0)).unwrap_or(0);
+            if actual != expected {
+                conflicts.push(json!({"entity_type": change.entity_type, "key": change.key, "expected_revision": expected, "actual_revision": actual}));
+                continue;
+            }
+        }
+        let revision = current_revision + applied.len() as i64 + 1;
+        let deleted = change.deleted.unwrap_or(false);
+        sqlx::query("insert into sync_documents (profile_id, document_type, document_key, payload, deleted, revision) values ($1, $2, $3, $4, $5, $6) on conflict (profile_id, document_type, document_key) do update set payload = excluded.payload, deleted = excluded.deleted, revision = excluded.revision, updated_at = now()")
+            .bind(input.profile_id).bind(&change.entity_type).bind(&change.key).bind(&payload).bind(deleted).bind(revision).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+        sqlx::query("insert into sync_events (profile_id, entity_type, document_key, payload, deleted, revision) values ($1, $2, $3, $4, $5, $6)")
+            .bind(input.profile_id).bind(&change.entity_type).bind(&change.key).bind(&payload).bind(deleted).bind(revision).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+        applied.push(json!({"revision": revision, "entity_type": change.entity_type, "key": change.key, "deleted": deleted}));
     }
+    sqlx::query("update profiles set sync_revision = $2, updated_at = now() where id = $1").bind(input.profile_id).bind(current_revision + applied.len() as i64).execute(&mut *transaction).await.map_err(ApiError::internal)?;
     transaction.commit().await.map_err(ApiError::internal)?;
-    Ok(Json(json!({"profile_id": input.profile_id, "applied": applied})))
+    let _ = state.events.send(json!({"profile_id": input.profile_id, "changes": applied.clone()}).to_string());
+    Ok(Json(json!({"profile_id": input.profile_id, "applied": applied, "conflicts": conflicts, "cursor": current_revision + applied.len() as i64})))
+}
+
+async fn realtime(State(state): State<AppState>, headers: HeaderMap, ws: WebSocketUpgrade) -> Result<Response, ApiError> {
+    authenticated_user(&headers, &state.jwt_secret)?;
+    let mut receiver = state.events.subscribe();
+    Ok(ws.on_upgrade(move |socket| async move {
+        let (mut sender, mut incoming) = socket.split();
+        loop {
+            tokio::select! {
+                event = receiver.recv() => match event {
+                    Ok(value) => if sender.send(Message::Text(value.into())).await.is_err() { break },
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                },
+                message = incoming.next() => match message {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => {},
+                    Some(Err(_)) => break,
+                }
+            }
+        }
+    }))
 }
 
 #[tokio::main]
@@ -205,7 +271,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if jwt_secret.len() < 32 { return Err("JWT_SECRET must contain at least 32 characters".into()); }
     let db = PgPool::connect(&database_url).await?;
     sqlx::migrate!().run(&db).await?;
-    let state = AppState { db, jwt_secret: Arc::new(jwt_secret) };
+    let (events, _) = broadcast::channel(256);
+    let state = AppState { db, jwt_secret: Arc::new(jwt_secret), events };
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/v1/auth/register", post(register))
@@ -214,9 +281,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/me", get(me))
         .route("/api/v1/profiles", get(profiles).post(create_profile))
+        .route("/api/v1/profiles/{profile_id}", patch(update_profile).delete(delete_profile))
         .route("/api/v1/sync/snapshot", get(snapshot))
         .route("/api/v1/sync/pull", get(pull))
         .route("/api/v1/sync/push", post(push))
+        .route("/api/v1/realtime", get(realtime))
         .with_state(state);
     let address: SocketAddr = format!("0.0.0.0:{}", env::var("PORT").unwrap_or_else(|_| "8080".into())).parse()?;
     let listener = tokio::net::TcpListener::bind(address).await?;

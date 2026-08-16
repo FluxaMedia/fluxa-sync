@@ -22,10 +22,10 @@ create table if not exists sync_documents (
     document_type text not null,
     document_key text not null,
     payload jsonb not null,
+    deleted boolean not null default false,
     revision bigint not null default 1,
     updated_at timestamptz not null default now(),
     unique(profile_id, document_type, document_key)
 );
 
 create index if not exists sync_documents_profile_revision_idx on sync_documents(profile_id, revision);
-

@@ -25,6 +25,8 @@ The first API version is intentionally client-agnostic:
 ```text
 POST /api/v1/auth/register
 POST /api/v1/auth/login
+POST /api/v1/auth/refresh
+POST /api/v1/auth/logout
 GET  /api/v1/auth/me
 GET  /api/v1/profiles
 POST /api/v1/profiles
@@ -36,7 +38,7 @@ GET  /health
 
 Sync documents use `entity_type` values such as `library`, `watch_progress`, `watched_history`, `collections`, `addons`, `plugins`, and `settings`. A push body contains a profile id and changes with an entity type, stable key, JSON payload, and optional deletion flag. Pull responses are ordered by a monotonic profile revision, making reconnects and delta sync deterministic.
 
-Authentication uses short-lived bearer JWTs signed by the instance's `JWT_SECRET`; passwords are stored with Argon2id. The service never exposes the database directly to clients.
+Authentication uses bearer JWT access tokens and rotating one-time refresh tokens. Access tokens are signed by the instance's `JWT_SECRET`, refresh tokens expire after 90 days and are revoked on rotation/logout, and passwords are stored with Argon2id. The service never exposes the database directly to clients.
 
 ## License
 

@@ -33,6 +33,11 @@ struct Credentials {
 }
 
 #[derive(Deserialize)]
+struct RefreshRequest {
+    refresh_token: String,
+}
+
+#[derive(Deserialize)]
 struct CreateProfile {
     name: String,
     avatar: Option<String>,
@@ -76,6 +81,14 @@ fn token_for(user_id: Uuid, secret: &str) -> Result<String, ApiError> {
     encode(&Header::default(), &claims, &EncodingKey::from_secret(secret.as_bytes())).map_err(ApiError::internal)
 }
 
+async fn session(state: &AppState, user_id: Uuid, email: String, created_at: chrono::DateTime<chrono::Utc>) -> Result<Json<Value>, ApiError> {
+    let access_token = token_for(user_id, &state.jwt_secret)?;
+    let refresh_token = Uuid::new_v4().to_string();
+    sqlx::query("insert into refresh_tokens (user_id, token, expires_at) values ($1, $2, now() + interval '90 days')")
+        .bind(user_id).bind(&refresh_token).execute(&state.db).await.map_err(ApiError::internal)?;
+    Ok(Json(json!({"access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer", "expires_in": 2592000, "user": {"id": user_id, "email": email, "created_at": created_at}})))
+}
+
 fn authenticated_user(headers: &HeaderMap, secret: &str) -> Result<Uuid, ApiError> {
     let value = headers.get("authorization").and_then(|value| value.to_str().ok()).ok_or_else(ApiError::unauthorized)?;
     let token = value.strip_prefix("Bearer ").ok_or_else(ApiError::unauthorized)?;
@@ -96,8 +109,7 @@ async fn register(State(state): State<AppState>, Json(input): Json<Credentials>)
         .bind(input.email.trim().to_ascii_lowercase()).bind(hash).fetch_one(&state.db).await.map_err(ApiError::internal)?;
     let user_id: Uuid = row.try_get("id").map_err(ApiError::internal)?;
     sqlx::query("insert into profiles (user_id, name) values ($1, $2)").bind(user_id).bind("Default").execute(&state.db).await.map_err(ApiError::internal)?;
-    let token = token_for(user_id, &state.jwt_secret)?;
-    Ok(Json(json!({"access_token": token, "token_type": "bearer", "user": {"id": user_id, "email": row.try_get::<String, _>("email").map_err(ApiError::internal)?, "created_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at").map_err(ApiError::internal)?}})))
+    session(&state, user_id, row.try_get::<String, _>("email").map_err(ApiError::internal)?, row.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at").map_err(ApiError::internal)?).await
 }
 
 async fn login(State(state): State<AppState>, Json(input): Json<Credentials>) -> Result<Json<Value>, ApiError> {
@@ -107,7 +119,20 @@ async fn login(State(state): State<AppState>, Json(input): Json<Credentials>) ->
     let parsed = PasswordHash::new(&hash).map_err(ApiError::internal)?;
     Argon2::default().verify_password(input.password.as_bytes(), &parsed).map_err(|_| ApiError::unauthorized())?;
     let user_id: Uuid = row.try_get("id").map_err(ApiError::internal)?;
-    Ok(Json(json!({"access_token": token_for(user_id, &state.jwt_secret)?, "token_type": "bearer", "user": {"id": user_id, "email": row.try_get::<String, _>("email").map_err(ApiError::internal)?, "created_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at").map_err(ApiError::internal)?}})))
+    session(&state, user_id, row.try_get::<String, _>("email").map_err(ApiError::internal)?, row.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at").map_err(ApiError::internal)?).await
+}
+
+async fn refresh(State(state): State<AppState>, Json(input): Json<RefreshRequest>) -> Result<Json<Value>, ApiError> {
+    let row = sqlx::query("select u.id, u.email, u.created_at from refresh_tokens r join users u on u.id = r.user_id where r.token = $1 and r.revoked_at is null and r.expires_at > now()")
+        .bind(&input.refresh_token).fetch_optional(&state.db).await.map_err(ApiError::internal)?.ok_or_else(ApiError::unauthorized)?;
+    sqlx::query("update refresh_tokens set revoked_at = now() where token = $1").bind(&input.refresh_token).execute(&state.db).await.map_err(ApiError::internal)?;
+    session(&state, row.try_get("id").map_err(ApiError::internal)?, row.try_get("email").map_err(ApiError::internal)?, row.try_get("created_at").map_err(ApiError::internal)?).await
+}
+
+async fn logout(State(state): State<AppState>, headers: HeaderMap, Json(input): Json<RefreshRequest>) -> Result<StatusCode, ApiError> {
+    authenticated_user(&headers, &state.jwt_secret)?;
+    sqlx::query("update refresh_tokens set revoked_at = now() where token = $1").bind(input.refresh_token).execute(&state.db).await.map_err(ApiError::internal)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn me(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
@@ -185,6 +210,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/health", get(health))
         .route("/api/v1/auth/register", post(register))
         .route("/api/v1/auth/login", post(login))
+        .route("/api/v1/auth/refresh", post(refresh))
+        .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/me", get(me))
         .route("/api/v1/profiles", get(profiles).post(create_profile))
         .route("/api/v1/sync/snapshot", get(snapshot))

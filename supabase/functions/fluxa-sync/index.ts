@@ -26,15 +26,38 @@ async function profileOwner(request: Request, profileId: string) {
   return result.data ? current : null
 }
 
+function sessionBody(data: Record<string, any>) {
+  const session = data?.session ?? null
+  const account = data?.user ?? session?.user ?? null
+  return {
+    access_token: session?.access_token ?? null,
+    refresh_token: session?.refresh_token ?? null,
+    token_type: 'bearer',
+    expires_in: session?.expires_in ?? null,
+    user: account ? { id: account.id, email: account.email, created_at: account.created_at } : null,
+  }
+}
+
 async function auth(request: Request, action: string) {
   if (action === 'me') {
     const current = await user(request)
-    return current ? { data: { id: current.id, email: current.email }, error: null } : { data: null, error: { message: 'unauthorized' } }
+    return current
+      ? { data: { id: current.id, email: current.email, created_at: current.created_at }, error: null }
+      : { data: null, error: { message: 'unauthorized' } }
   }
   const body = await request.json()
-  if (action === 'register') return authClient.auth.signUp({ email: body.email, password: body.password })
-  if (action === 'login') return authClient.auth.signInWithPassword({ email: body.email, password: body.password })
-  if (action === 'refresh') return authClient.auth.refreshSession({ refresh_token: body.refresh_token })
+  if (action === 'register') {
+    const result = await authClient.auth.signUp({ email: body.email, password: body.password })
+    return result.error ? result : { data: sessionBody(result.data), error: null }
+  }
+  if (action === 'login') {
+    const result = await authClient.auth.signInWithPassword({ email: body.email, password: body.password })
+    return result.error ? result : { data: sessionBody(result.data), error: null }
+  }
+  if (action === 'refresh') {
+    const result = await authClient.auth.refreshSession({ refresh_token: body.refresh_token })
+    return result.error ? result : { data: sessionBody(result.data), error: null }
+  }
   if (action === 'logout') {
     const result = await authClient.auth.signOut()
     return { data: {}, error: result.error }

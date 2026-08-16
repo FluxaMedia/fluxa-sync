@@ -1,0 +1,5 @@
+project_id = "fluxa-sync"
+
+[functions.fluxa-sync]
+verify_jwt = false
+

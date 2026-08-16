@@ -41,6 +41,24 @@ Sync documents use `entity_type` values such as `library`, `watch_progress`, `wa
 
 Authentication uses bearer JWT access tokens and rotating one-time refresh tokens. Access tokens are signed by the instance's `JWT_SECRET`, refresh tokens expire after 90 days and are revoked on rotation/logout, and passwords are stored with Argon2id. The service never exposes the database directly to clients.
 
+## Supabase deployment mode
+
+The repository also includes a Supabase-native adapter under `supabase/`. It uses Supabase Auth for email/password sessions, Supabase Postgres for the same profile/document/event model, and Supabase Realtime for change notifications.
+
+```sh
+supabase link --project-ref YOUR_PROJECT_REF
+supabase db push
+supabase functions deploy fluxa-sync --no-verify-jwt
+```
+
+The client URL for this mode is:
+
+```text
+https://YOUR_PROJECT_REF.supabase.co/functions/v1/fluxa-sync
+```
+
+The standalone Rust server and Supabase adapter expose the same `/api/v1` contract. Supabase Realtime is notification-only; clients continue from the durable sync cursor after reconnecting.
+
 Push changes may include `expected_revision`. When another device has already changed that document, the server leaves the incoming change unapplied and returns it in `conflicts` with both revisions. The client can then merge the JSON payload and retry.
 
 Event history is compacted automatically according to `SYNC_EVENT_RETENTION_DAYS` (90 by default). A pull response includes `minimum_available_revision` and `reset_required`. If `reset_required` is true, download `/sync/snapshot`, replace the local state, and continue from the snapshot cursor.

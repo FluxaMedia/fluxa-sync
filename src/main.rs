@@ -1,5 +1,5 @@
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
-use axum::{Json, Router, extract::{Query, State, WebSocketUpgrade, ws::Message}, http::{HeaderMap, StatusCode}, response::{IntoResponse, Response}, routing::{get, patch, post}};
+use axum::{Json, Router, extract::{Query, State, WebSocketUpgrade, ws::Message}, http::{HeaderMap, StatusCode, header}, response::{IntoResponse, Response}, routing::{get, patch, post}};
 use futures_util::{SinkExt, StreamExt};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use rand_core::OsRng;
@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 use std::{env, net::SocketAddr, sync::Arc};
 use tokio::sync::broadcast;
+use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -307,6 +308,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/sync/pull", get(pull))
         .route("/api/v1/sync/push", post(push))
         .route("/api/v1/realtime", get(realtime))
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
+        )
         .with_state(state);
     let address: SocketAddr = format!("0.0.0.0:{}", env::var("PORT").unwrap_or_else(|_| "8080".into())).parse()?;
     let listener = tokio::net::TcpListener::bind(address).await?;

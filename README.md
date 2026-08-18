@@ -65,6 +65,14 @@ Event history is compacted automatically according to `SYNC_EVENT_RETENTION_DAYS
 
 The realtime endpoint is a WebSocket event channel. It broadcasts committed profile changes; clients still use `/sync/pull` as the durable source of truth after reconnects.
 
+## Running on Supabase's free tier
+
+Both deployment modes fit the free tier if a few things are set correctly:
+
+- **Database size (500MB cap)**: `sync_events`, `sync_audit_log`, `watch_progress_events`, and `watched_item_events` are append-only logs. The Rust server compacts `sync_events` on its own hourly timer (`SYNC_EVENT_RETENTION_DAYS`). The Supabase adapter has no server process to do that, so migration `0009_event_retention_cron.sql` schedules a daily `pg_cron` job (`fluxa_sync_retention`) that prunes all four tables. Confirm `pg_cron` is enabled for the project after running `supabase db push`.
+- **Connection limits**: if you point the standalone Rust server's `DATABASE_URL` at a Supabase free-tier project, use the pooled connection string (port `6543`, transaction mode) rather than the direct one (port `5432`) — the free tier's direct-connection quota is small. When using the transaction pooler, set `DATABASE_DISABLE_STATEMENT_CACHE=1`; pgbouncer in transaction mode doesn't guarantee the same backend connection across statements, so sqlx's prepared-statement cache must be off. Keep `DATABASE_MAX_CONNECTIONS` modest (default 10) — a handful of pooled connections comfortably serves thousands of users since each request only holds one for the duration of its query.
+- **Edge function invocations**: `sync/push` batches all distinct document keys in a request concurrently instead of one network round trip per change, which keeps batched pushes well under the function's wall-time budget as change counts grow.
+
 ## Backups
 
 Install PostgreSQL client tools and run:

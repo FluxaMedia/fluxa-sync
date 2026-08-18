@@ -5,8 +5,8 @@ use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode}
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::{PgPool, Row};
-use std::{env, net::SocketAddr, sync::Arc};
+use sqlx::{PgPool, Row, postgres::{PgConnectOptions, PgPoolOptions}};
+use std::{env, net::SocketAddr, str::FromStr, sync::Arc};
 use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
 use uuid::Uuid;
@@ -200,10 +200,13 @@ async fn owns_profile(state: &AppState, user_id: Uuid, profile_id: Uuid) -> Resu
 async fn snapshot(State(state): State<AppState>, headers: HeaderMap, Query(query): Query<SyncQuery>) -> Result<Json<Value>, ApiError> {
     let user_id = authenticated_user(&headers, &state.jwt_secret)?;
     owns_profile(&state, user_id, query.profile_id).await?;
-    let rows = sqlx::query("select entity_type, document_key, payload, deleted, revision, updated_at from sync_documents where profile_id = $1 order by revision")
-        .bind(query.profile_id).fetch_all(&state.db).await.map_err(ApiError::internal)?;
+    let (rows, cursor_row) = tokio::try_join!(
+        sqlx::query("select entity_type, document_key, payload, deleted, revision, updated_at from sync_documents where profile_id = $1 order by revision")
+            .bind(query.profile_id).fetch_all(&state.db),
+        sqlx::query("select sync_revision from profiles where id = $1").bind(query.profile_id).fetch_one(&state.db),
+    ).map_err(ApiError::internal)?;
     let documents = rows.into_iter().map(|row| json!({"entity_type": row.try_get::<String, _>("entity_type").unwrap_or_default(), "key": row.try_get::<String, _>("document_key").unwrap_or_default(), "payload": row.try_get::<Value, _>("payload").unwrap_or(Value::Null), "deleted": row.try_get::<bool, _>("deleted").unwrap_or(false), "revision": row.try_get::<i64, _>("revision").unwrap_or_default(), "updated_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at").unwrap_or_else(|_| chrono::Utc::now())})).collect::<Vec<_>>();
-    let cursor = sqlx::query("select sync_revision from profiles where id = $1").bind(query.profile_id).fetch_one(&state.db).await.map_err(ApiError::internal)?.try_get::<i64, _>("sync_revision").map_err(ApiError::internal)?;
+    let cursor = cursor_row.try_get::<i64, _>("sync_revision").map_err(ApiError::internal)?;
     Ok(Json(json!({"profile_id": query.profile_id, "cursor": cursor, "documents": documents})))
 }
 
@@ -211,11 +214,15 @@ async fn pull(State(state): State<AppState>, headers: HeaderMap, Query(query): Q
     let user_id = authenticated_user(&headers, &state.jwt_secret)?;
     owns_profile(&state, user_id, query.profile_id).await?;
     let since = query.since.unwrap_or(0);
-    let current_revision = sqlx::query("select sync_revision from profiles where id = $1").bind(query.profile_id).fetch_one(&state.db).await.map_err(ApiError::internal)?.try_get::<i64, _>("sync_revision").map_err(ApiError::internal)?;
-    let minimum = sqlx::query("select min(revision) as revision from sync_events where profile_id = $1").bind(query.profile_id).fetch_one(&state.db).await.map_err(ApiError::internal)?.try_get::<Option<i64>, _>("revision").map_err(ApiError::internal)?;
+    let (current_revision_row, minimum_row, rows) = tokio::try_join!(
+        sqlx::query("select sync_revision from profiles where id = $1").bind(query.profile_id).fetch_one(&state.db),
+        sqlx::query("select min(revision) as revision from sync_events where profile_id = $1").bind(query.profile_id).fetch_one(&state.db),
+        sqlx::query("select entity_type, document_key, payload, deleted, revision, created_at from sync_events where profile_id = $1 and revision > $2 order by revision")
+            .bind(query.profile_id).bind(since).fetch_all(&state.db),
+    ).map_err(ApiError::internal)?;
+    let current_revision = current_revision_row.try_get::<i64, _>("sync_revision").map_err(ApiError::internal)?;
+    let minimum = minimum_row.try_get::<Option<i64>, _>("revision").map_err(ApiError::internal)?;
     let reset_required = since > 0 && match minimum { Some(revision) => since < revision - 1, None => since < current_revision };
-    let rows = sqlx::query("select entity_type, document_key, payload, deleted, revision, created_at from sync_events where profile_id = $1 and revision > $2 order by revision")
-        .bind(query.profile_id).bind(since).fetch_all(&state.db).await.map_err(ApiError::internal)?;
     let changes = rows.into_iter().map(|row| json!({"entity_type": row.try_get::<String, _>("entity_type").unwrap_or_default(), "key": row.try_get::<String, _>("document_key").unwrap_or_default(), "payload": row.try_get::<Value, _>("payload").unwrap_or(Value::Null), "revision": row.try_get::<i64, _>("revision").unwrap_or_default(), "deleted": row.try_get::<bool, _>("deleted").unwrap_or(false), "updated_at": row.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at").unwrap_or_else(|_| chrono::Utc::now())})).collect::<Vec<_>>();
     let cursor = json!(current_revision);
     Ok(Json(json!({"profile_id": query.profile_id, "since": since, "cursor": cursor, "minimum_available_revision": minimum, "reset_required": reset_required, "changes": changes})))
@@ -282,7 +289,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_url = env::var("DATABASE_URL")?;
     let jwt_secret = env::var("JWT_SECRET")?;
     if jwt_secret.len() < 32 { return Err("JWT_SECRET must contain at least 32 characters".into()); }
-    let db = PgPool::connect(&database_url).await?;
+    let mut connect_options = PgConnectOptions::from_str(&database_url)?;
+    if env::var("DATABASE_DISABLE_STATEMENT_CACHE").map(|value| value == "1").unwrap_or(false) {
+        connect_options = connect_options.statement_cache_capacity(0);
+    }
+    let max_connections = env::var("DATABASE_MAX_CONNECTIONS").ok().and_then(|value| value.parse().ok()).unwrap_or(10);
+    let db: PgPool = PgPoolOptions::new().max_connections(max_connections).connect_with(connect_options).await?;
     sqlx::migrate!().run(&db).await?;
     let (events, _) = broadcast::channel(256);
     let state = AppState { db, jwt_secret: Arc::new(jwt_secret), events };

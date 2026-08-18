@@ -449,38 +449,64 @@ async function syncPush(request: Request) {
   const profile = await db.from('profiles').select('sync_revision').eq('id', profileId).single()
   if (profile.error) return response({ error: 'database error' }, 500)
   let revision = profile.data.sync_revision as number
+  const changes = body.changes ?? []
+  const results: ({ kind: 'applied' | 'conflict'; value: Record<string, unknown> } | null)[] = new Array(changes.length).fill(null)
+  let databaseError = false
+
+  const groups = new Map<string, number[]>()
+  changes.forEach((change: Record<string, unknown>, index: number) => {
+    const groupKey = `${change.entity_type} ${change.key}`
+    const indexes = groups.get(groupKey) ?? []
+    indexes.push(index)
+    groups.set(groupKey, indexes)
+  })
+
+  await Promise.all([...groups.values()].map(async (indexes) => {
+    for (const index of indexes) {
+      if (databaseError) return
+      const change = changes[index]
+      const existing = await db.from('sync_documents').select('revision,payload,deleted').eq('profile_id', profileId).eq('document_type', change.entity_type).eq('document_key', change.key).maybeSingle()
+      if (existing.error) { databaseError = true; return }
+      if (change.expected_revision !== undefined && (existing.data?.revision ?? 0) !== change.expected_revision) {
+        results[index] = { kind: 'conflict', value: { entity_type: change.entity_type, key: change.key, expected_revision: change.expected_revision, actual_revision: existing.data?.revision ?? 0 } }
+        continue
+      }
+      if (existing.data && existing.data.deleted === (change.deleted === true) && samePayload(existing.data.payload, change.payload ?? null)) {
+        results[index] = { kind: 'applied', value: { entity_type: change.entity_type, key: change.key, revision: existing.data.revision, deleted: change.deleted === true } }
+        continue
+      }
+      if (change.entity_type === 'watch_progress' && existing.data?.deleted !== true && shouldThrottleProgress(existing.data?.payload, change.payload)) {
+        results[index] = { kind: 'applied', value: { entity_type: change.entity_type, key: change.key, revision: existing.data?.revision ?? revision, deleted: false } }
+        continue
+      }
+      revision += 1
+      const requestedRevision = revision
+      const payload = change.payload ?? null
+      const deleted = change.deleted === true
+      const appliedChange = await db.rpc('sync_apply_change_locked_v2', {
+        p_profile_id: profileId,
+        p_entity_type: change.entity_type,
+        p_document_key: change.key,
+        p_payload: payload,
+        p_deleted: deleted,
+        p_requested_revision: requestedRevision,
+      })
+      if (appliedChange.error) { databaseError = true; return }
+      const parsedRevision = Number(appliedChange.data)
+      const appliedRevision = Number.isSafeInteger(parsedRevision) ? parsedRevision : requestedRevision
+      revision = Math.max(revision, appliedRevision)
+      results[index] = { kind: 'applied', value: { entity_type: change.entity_type, key: change.key, revision: appliedRevision, deleted } }
+    }
+  }))
+
+  if (databaseError) return response({ error: 'database error' }, 500)
+
   const applied = []
   const conflicts = []
-  for (const change of body.changes ?? []) {
-    const existing = await db.from('sync_documents').select('revision,payload,deleted').eq('profile_id', profileId).eq('document_type', change.entity_type).eq('document_key', change.key).maybeSingle()
-    if (change.expected_revision !== undefined && (existing.data?.revision ?? 0) !== change.expected_revision) {
-      conflicts.push({ entity_type: change.entity_type, key: change.key, expected_revision: change.expected_revision, actual_revision: existing.data?.revision ?? 0 })
-      continue
-    }
-    if (existing.data && existing.data.deleted === (change.deleted === true) && samePayload(existing.data.payload, change.payload ?? null)) {
-      applied.push({ entity_type: change.entity_type, key: change.key, revision: existing.data.revision, deleted: change.deleted === true })
-      continue
-    }
-    if (change.entity_type === 'watch_progress' && existing.data?.deleted !== true && shouldThrottleProgress(existing.data?.payload, change.payload)) {
-      applied.push({ entity_type: change.entity_type, key: change.key, revision: existing.data?.revision ?? revision, deleted: false })
-      continue
-    }
-    revision += 1
-    const payload = change.payload ?? null
-    const deleted = change.deleted === true
-    const appliedChange = await db.rpc('sync_apply_change_locked_v2', {
-      p_profile_id: profileId,
-      p_entity_type: change.entity_type,
-      p_document_key: change.key,
-      p_payload: payload,
-      p_deleted: deleted,
-      p_requested_revision: revision,
-    })
-    if (appliedChange.error) return response({ error: 'database error' }, 500)
-    const parsedRevision = Number(appliedChange.data)
-    const appliedRevision = Number.isSafeInteger(parsedRevision) ? parsedRevision : revision
-    revision = Math.max(revision, appliedRevision)
-    applied.push({ entity_type: change.entity_type, key: change.key, revision: appliedRevision, deleted })
+  for (const result of results) {
+    if (!result) continue
+    if (result.kind === 'applied') applied.push(result.value)
+    else conflicts.push(result.value)
   }
   return response({ profile_id: profileId, cursor: revision, applied, conflicts })
 }

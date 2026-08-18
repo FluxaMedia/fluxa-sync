@@ -418,6 +418,9 @@ async function syncPush(request: Request) {
   }
   if (!await profileOwner(request, body.profile_id)) return response({ error: 'unauthorized' }, 401)
   const profileId = body.profile_id as string
+  const limit = await db.rpc('sync_check_rate_limit', { p_profile_id: profileId, p_max_requests: 120 })
+  if (limit.error) return response({ error: 'database error' }, 500)
+  if (limit.data === false) return response({ error: 'rate limit exceeded' }, 429)
   const profile = await db.from('profiles').select('sync_revision').eq('id', profileId).single()
   if (profile.error) return response({ error: 'database error' }, 500)
   let revision = profile.data.sync_revision as number

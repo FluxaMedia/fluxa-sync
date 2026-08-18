@@ -319,12 +319,77 @@ async function auth(request: Request, action: string) {
 
 async function syncSnapshot(request: Request, profileId: string) {
   if (!await profileOwner(request, profileId)) return response({ error: 'unauthorized' }, 401)
-  const [documents, profile] = await Promise.all([
+  const [documents, profile, library, progress, history] = await Promise.all([
     db.from('sync_documents').select('document_type,document_key,payload,deleted,revision,updated_at').eq('profile_id', profileId).order('revision'),
     db.from('profiles').select('sync_revision').eq('id', profileId).single(),
+    db.from('library_items').select('*').eq('profile_id', profileId),
+    db.from('watch_progress').select('*').eq('profile_id', profileId),
+    db.from('watched_items').select('*').eq('profile_id', profileId),
   ])
-  if (documents.error || profile.error) return response({ error: 'database error' }, 500)
-  return response({ profile_id: profileId, cursor: profile.data.sync_revision, documents: documents.data })
+  if (documents.error || profile.error || library.error || progress.error || history.error) return response({ error: 'database error' }, 500)
+
+  const cursor = profile.data.sync_revision
+  const generic = documents.data ?? []
+  const typedEntities = new Set<string>()
+  const typedDocuments: any[] = []
+  const appendTyped = (entity_type: string, document_key: string, payload: unknown) => {
+    typedEntities.add(entity_type)
+    typedDocuments.push({ entity_type, document_key, payload, deleted: false, revision: cursor, updated_at: new Date().toISOString() })
+  }
+
+  for (const row of library.data ?? []) {
+    appendTyped('library', row.content_id, {
+      status: row.status,
+      item: {
+        id: row.content_id,
+        type: row.content_type,
+        name: row.name,
+        poster: row.poster,
+        posterShape: row.poster_shape,
+        background: row.background,
+        description: row.description,
+        releaseInfo: row.release_info,
+        imdbRating: row.imdb_rating,
+        genres: row.genres,
+        addonBaseUrl: row.addon_base_url,
+        addedAt: row.added_at,
+      },
+    })
+  }
+  for (const row of progress.data ?? []) {
+    appendTyped('watch_progress', row.progress_key, {
+      contentId: row.content_id,
+      contentType: row.content_type,
+      videoId: row.video_id,
+      season: row.season,
+      episode: row.episode,
+      position: row.position,
+      duration: row.duration,
+      lastWatched: row.last_watched,
+      progressKey: row.progress_key,
+      lastAudioLanguage: row.last_audio_language,
+      lastSubtitleLanguage: row.last_subtitle_language,
+      lastStreamIndex: row.last_stream_index,
+    })
+  }
+  for (const row of history.data ?? []) {
+    const key = row.season === null || row.episode === null ? `video:${row.content_id}` : `series:${row.content_id}`
+    appendTyped('watched_history', key, {
+      watched: true,
+      videoId: row.content_id,
+      season: row.season,
+      episode: row.episode,
+      lastWatched: row.watched_at,
+    })
+  }
+
+  // Older profiles may predate the typed mirror. Keep their generic documents
+  // until the next successful write hydrates the domain tables.
+  const documentsForSnapshot = [
+    ...generic.filter((document) => !typedEntities.has(document.document_type)),
+    ...typedDocuments,
+  ]
+  return response({ profile_id: profileId, cursor, documents: documentsForSnapshot })
 }
 
 async function syncPull(request: Request, profileId: string, since: number) {

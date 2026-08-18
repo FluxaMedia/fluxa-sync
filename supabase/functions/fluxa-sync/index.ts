@@ -43,6 +43,18 @@ function validHttpUrl(value: unknown): boolean {
   }
 }
 
+function canonicalJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalJson)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([key, child]) => [key, canonicalJson(child)]))
+  }
+  return value
+}
+
+function samePayload(left: unknown, right: unknown): boolean {
+  return JSON.stringify(canonicalJson(left)) === JSON.stringify(canonicalJson(right))
+}
+
 function validateEntityPayload(entity: string, payload: unknown): string | null {
   if (payload === null || typeof payload !== 'object') return `${entity} payload must be an object or array`
   if (entity === 'addons') {
@@ -51,8 +63,13 @@ function validateEntityPayload(entity: string, payload: unknown): string | null 
       if (!addon || typeof addon !== 'object') return 'each addon must be an object'
       const item = addon as Record<string, unknown>
       const manifest = item.manifest as Record<string, unknown> | undefined
-      if (!manifest || typeof manifest.id !== 'string' || typeof manifest.name !== 'string') return 'addon manifest id and name are required'
-      if (!validHttpUrl(item.transportUrl)) return 'addon transportUrl must be an http(s) URL without credentials'
+      const url = item.transportUrl ?? item.url
+      if (manifest) {
+        if (typeof manifest.id !== 'string' || typeof manifest.name !== 'string') return 'addon manifest id and name are required'
+      } else if (typeof item.name !== 'string') {
+        return 'normalized addon name is required'
+      }
+      if (!validHttpUrl(url)) return 'addon URL must be an http(s) URL without credentials'
     }
   }
   if (entity === 'plugins') {
@@ -230,8 +247,8 @@ async function mirrorDomain(profileId: string, change: Record<string, any>) {
     await db.from('addons').delete().eq('profile_id', profileId)
     const rows = payload.map((addon: any, index: number) => ({
       profile_id: profileId,
-      url: addon.transportUrl,
-      name: addon.manifest?.name ?? null,
+      url: addon.transportUrl ?? addon.url,
+      name: addon.manifest?.name ?? addon.name ?? null,
       enabled: addon.enabled !== false,
       sort_order: index,
     }))
@@ -430,6 +447,10 @@ async function syncPush(request: Request) {
     const existing = await db.from('sync_documents').select('revision,payload,deleted').eq('profile_id', profileId).eq('document_type', change.entity_type).eq('document_key', change.key).maybeSingle()
     if (change.expected_revision !== undefined && (existing.data?.revision ?? 0) !== change.expected_revision) {
       conflicts.push({ entity_type: change.entity_type, key: change.key, expected_revision: change.expected_revision, actual_revision: existing.data?.revision ?? 0 })
+      continue
+    }
+    if (existing.data && existing.data.deleted === (change.deleted === true) && samePayload(existing.data.payload, change.payload ?? null)) {
+      applied.push({ entity_type: change.entity_type, key: change.key, revision: existing.data.revision, deleted: change.deleted === true })
       continue
     }
     if (change.entity_type === 'watch_progress' && existing.data?.deleted !== true && shouldThrottleProgress(existing.data?.payload, change.payload)) {

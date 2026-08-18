@@ -104,6 +104,14 @@ function validateEntityPayload(entity: string, payload: unknown): string | null 
   if (entity === 'settings' && (payload as Record<string, unknown>).profile) {
     return 'profile settings must use key profile, not a nested profile payload'
   }
+  if (entity === 'settings' && typeof payload === 'object') {
+    const value = payload as Record<string, unknown>
+    if (value.name !== undefined && typeof value.name !== 'string') return 'profile name must be a string'
+    if (value.avatarUrl !== undefined && value.avatarUrl !== null && !validHttpUrl(value.avatarUrl)) return 'profile avatarUrl must be an http(s) URL'
+    for (const key of ['usesPrimaryAddons', 'usesPrimaryPlugins']) {
+      if (value[key] !== undefined && typeof value[key] !== 'boolean') return `${key} must be boolean`
+    }
+  }
   return null
 }
 
@@ -460,7 +468,7 @@ async function syncPush(request: Request) {
     revision += 1
     const payload = change.payload ?? null
     const deleted = change.deleted === true
-    const appliedChange = await db.rpc('sync_apply_change_locked', {
+    const appliedChange = await db.rpc('sync_apply_change_locked_v2', {
       p_profile_id: profileId,
       p_entity_type: change.entity_type,
       p_document_key: change.key,

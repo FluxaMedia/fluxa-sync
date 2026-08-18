@@ -75,7 +75,8 @@ function validateEntityPayload(entity: string, payload: unknown): string | null 
   }
   if (entity === 'watched_history') {
     const value = payload as Record<string, unknown>
-    if (Object.keys(value).some((key) => !['watched', 'videoId', 'season', 'episode', 'lastWatched'].includes(key))) return 'watched history metadata is not allowed'
+    if (Object.keys(value).some((key) => !['watched', 'contentType', 'videoId', 'season', 'episode', 'lastWatched'].includes(key))) return 'watched history metadata is not allowed'
+    if (value.contentType !== undefined && typeof value.contentType !== 'string') return 'watched history contentType must be a string'
   }
   if (entity === 'watch_progress') {
     const allowed = ['contentId', 'contentType', 'videoId', 'season', 'episode', 'position', 'duration', 'lastWatched', 'progressKey', 'lastAudioLanguage', 'lastSubtitleLanguage', 'lastStreamIndex']
@@ -435,14 +436,20 @@ async function syncPush(request: Request) {
     revision += 1
     const payload = change.payload ?? null
     const deleted = change.deleted === true
-    const document = await db.from('sync_documents').upsert({ profile_id: profileId, document_type: change.entity_type, document_key: change.key, payload, deleted, revision }, { onConflict: 'profile_id,document_type,document_key' })
-    const event = await db.from('sync_events').insert({ profile_id: profileId, entity_type: change.entity_type, document_key: change.key, payload, deleted, revision })
-    if (document.error || event.error) return response({ error: 'database error' }, 500)
-    await mirrorDomain(profileId, change)
-    applied.push({ entity_type: change.entity_type, key: change.key, revision, deleted })
+    const appliedChange = await db.rpc('sync_apply_change_locked', {
+      p_profile_id: profileId,
+      p_entity_type: change.entity_type,
+      p_document_key: change.key,
+      p_payload: payload,
+      p_deleted: deleted,
+      p_requested_revision: revision,
+    })
+    if (appliedChange.error) return response({ error: 'database error' }, 500)
+    const parsedRevision = Number(appliedChange.data)
+    const appliedRevision = Number.isSafeInteger(parsedRevision) ? parsedRevision : revision
+    revision = Math.max(revision, appliedRevision)
+    applied.push({ entity_type: change.entity_type, key: change.key, revision: appliedRevision, deleted })
   }
-  const update = await db.from('profiles').update({ sync_revision: revision, updated_at: new Date().toISOString() }).eq('id', profileId)
-  if (update.error) return response({ error: 'database error' }, 500)
   return response({ profile_id: profileId, cursor: revision, applied, conflicts })
 }
 

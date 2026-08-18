@@ -27,6 +27,8 @@ end $$;
 create unique index if not exists watched_items_profile_content_season_episode_idx
     on public.watched_items (profile_id, content_id, content_type, coalesce(season, -1), coalesce(episode, -1));
 
+drop function if exists public.sync_apply_change(uuid, text, text, jsonb, boolean, bigint);
+
 create or replace function public.sync_apply_change(
     p_profile_id uuid,
     p_entity_type text,

@@ -12,6 +12,258 @@ function response(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { ...cors, 'content-type': 'application/json' } })
 }
 
+const sensitiveField = /^(?:.*(?:access|refresh)[_-]?token|.*(?:api[_-]?key|secret|password|passwd|authorization)|pinHash|nuvioAccessToken|nuvioRefreshToken|stremioToken)$/i
+const entityTypes = new Set(['library', 'watch_progress', 'watched_history', 'collections', 'addons', 'plugins', 'settings'])
+
+function sensitivePath(value: unknown, path = 'payload'): string | null {
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      const found = sensitivePath(value[index], `${path}[${index}]`)
+      if (found) return found
+    }
+    return null
+  }
+  if (!value || typeof value !== 'object') return null
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    if (sensitiveField.test(key)) return `${path}.${key}`
+    const found = sensitivePath(child, `${path}.${key}`)
+    if (found) return found
+  }
+  return null
+}
+
+function validHttpUrl(value: unknown): boolean {
+  if (typeof value !== 'string' || value.length > 2048) return false
+  try {
+    const url = new URL(value)
+    if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.username || url.password) return false
+    return [...url.searchParams.keys()].every((key) => !sensitiveField.test(key))
+  } catch {
+    return false
+  }
+}
+
+function validateEntityPayload(entity: string, payload: unknown): string | null {
+  if (payload === null || typeof payload !== 'object') return `${entity} payload must be an object or array`
+  if (entity === 'addons') {
+    if (!Array.isArray(payload) || payload.length > 500) return 'addons payload must be an array of at most 500 items'
+    for (const addon of payload) {
+      if (!addon || typeof addon !== 'object') return 'each addon must be an object'
+      const item = addon as Record<string, unknown>
+      const manifest = item.manifest as Record<string, unknown> | undefined
+      if (!manifest || typeof manifest.id !== 'string' || typeof manifest.name !== 'string') return 'addon manifest id and name are required'
+      if (!validHttpUrl(item.transportUrl)) return 'addon transportUrl must be an http(s) URL without credentials'
+    }
+  }
+  if (entity === 'plugins') {
+    const value = payload as Record<string, unknown>
+    if (!Array.isArray(value.repositoryUrls) || value.repositoryUrls.length > 200 || !value.repositoryUrls.every(validHttpUrl)) {
+      return 'plugins.repositoryUrls must contain only http(s) URLs without credentials'
+    }
+    if (!value.scraperOverrides || typeof value.scraperOverrides !== 'object' || Array.isArray(value.scraperOverrides)) {
+      return 'plugins.scraperOverrides must be an object'
+    }
+    if (!Object.values(value.scraperOverrides as Record<string, unknown>).every((entry) => typeof entry === 'boolean')) {
+      return 'plugins.scraperOverrides values must be boolean'
+    }
+  }
+  if (entity === 'library') {
+    const value = payload as Record<string, unknown>
+    const item = value.item as Record<string, unknown> | undefined
+    if (!['watchlist', 'completed', 'dropped'].includes(String(value.status))) return 'library status is invalid'
+    if (!item || typeof item.id !== 'string' || typeof item.type !== 'string') return 'library item id and type are required'
+  }
+  if (entity === 'watched_history') {
+    const value = payload as Record<string, unknown>
+    if (Object.keys(value).some((key) => !['watched', 'videoId', 'season', 'episode', 'lastWatched'].includes(key))) return 'watched history metadata is not allowed'
+  }
+  if (entity === 'watch_progress') {
+    const allowed = ['contentId', 'contentType', 'videoId', 'season', 'episode', 'position', 'duration', 'lastWatched', 'progressKey', 'lastAudioLanguage', 'lastSubtitleLanguage', 'lastStreamIndex']
+    if (Object.keys(payload as Record<string, unknown>).some((key) => !allowed.includes(key))) return 'watch progress metadata is not allowed'
+    const value = payload as Record<string, unknown>
+    if (typeof value.contentId !== 'string' || typeof value.contentType !== 'string' || typeof value.position !== 'number' || typeof value.duration !== 'number') return 'watch progress identity and timing are required'
+  }
+  if (entity === 'settings' && (payload as Record<string, unknown>).profile) {
+    return 'profile settings must use key profile, not a nested profile payload'
+  }
+  return null
+}
+
+function validateProfileBody(body: Record<string, unknown>): string | null {
+  if (typeof body.name !== 'string' || body.name.trim().length < 1 || body.name.length > 160) return 'profile name is required'
+  if (body.avatar !== undefined && body.avatar !== null && !validHttpUrl(body.avatar)) return 'profile avatar must be an http(s) URL without credentials'
+  const unsafe = sensitivePath(body.settings ?? {}, 'settings')
+  return unsafe ? `sensitive field is not allowed: ${unsafe}` : null
+}
+
+function validateChange(change: unknown): string | null {
+  if (!change || typeof change !== 'object') return 'each change must be an object'
+  const value = change as Record<string, unknown>
+  const entity = value.entity_type
+  const key = value.key
+  if (typeof entity !== 'string' || !entityTypes.has(entity)) return 'unsupported entity_type'
+  if (typeof key !== 'string' || key.length < 1 || key.length > 512) return 'invalid document key'
+  if (value.expected_revision !== undefined && (!Number.isInteger(value.expected_revision) || (value.expected_revision as number) < 0)) {
+    return 'expected_revision must be a non-negative integer'
+  }
+  const unsafe = sensitivePath(value.payload)
+  if (unsafe) return `sensitive field is not allowed: ${unsafe}`
+  if (value.deleted === true) return value.payload == null ? null : 'deleted changes must not include a payload'
+  if (JSON.stringify(value.payload ?? null).length > 512_000) return 'payload is too large'
+  return validateEntityPayload(entity, value.payload)
+}
+
+function shouldThrottleProgress(previous: unknown, incoming: unknown): boolean {
+  if (!previous || typeof previous !== 'object' || !incoming || typeof incoming !== 'object') return false
+  const oldValue = previous as Record<string, unknown>
+  const nextValue = incoming as Record<string, unknown>
+  for (const key of ['contentId', 'contentType', 'videoId', 'season', 'episode', 'duration', 'progressKey']) {
+    if (oldValue[key] !== nextValue[key]) return false
+  }
+  const oldPosition = typeof oldValue.position === 'number' ? oldValue.position : 0
+  const nextPosition = typeof nextValue.position === 'number' ? nextValue.position : 0
+  const oldWatched = typeof oldValue.lastWatched === 'number' ? oldValue.lastWatched : 0
+  const nextWatched = typeof nextValue.lastWatched === 'number' ? nextValue.lastWatched : 0
+  const crossedCompletion = nextValue.duration && nextPosition >= Number(nextValue.duration) * 0.9
+    && !(oldValue.duration && oldPosition >= Number(oldValue.duration) * 0.9)
+  return Math.abs(nextPosition - oldPosition) < 15_000 && nextWatched - oldWatched < 30_000 && !crossedCompletion
+}
+
+function numberValue(value: unknown, fallback = 0): number {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.trunc(value) : fallback
+}
+
+function textValue(value: unknown, fallback = ''): string {
+  return typeof value === 'string' ? value : fallback
+}
+
+function libraryRow(profileId: string, status: string, item: Record<string, unknown>) {
+  return {
+    profile_id: profileId,
+    content_id: textValue(item.id),
+    content_type: textValue(item.type),
+    status,
+    name: textValue(item.name ?? item.title),
+    poster: typeof item.poster === 'string' ? item.poster : null,
+    poster_shape: textValue(item.posterShape ?? item.poster_shape, 'POSTER'),
+    background: typeof item.background === 'string' ? item.background : null,
+    description: typeof item.description === 'string' ? item.description : null,
+    release_info: typeof (item.releaseInfo ?? item.release_info) === 'string' ? (item.releaseInfo ?? item.release_info) : null,
+    imdb_rating: typeof (item.imdbRating ?? item.imdb_rating) === 'number' ? (item.imdbRating ?? item.imdb_rating) : null,
+    genres: Array.isArray(item.genres) ? item.genres.filter((entry): entry is string => typeof entry === 'string') : [],
+    addon_base_url: typeof (item.addonBaseUrl ?? item.addon_base_url) === 'string' ? (item.addonBaseUrl ?? item.addon_base_url) : null,
+    added_at: numberValue(item.addedAt ?? item.added_at),
+    updated_at: new Date().toISOString(),
+  }
+}
+
+async function mirrorDomain(profileId: string, change: Record<string, any>) {
+  const entity = change.entity_type as string
+  const deleted = change.deleted === true
+  const payload = change.payload as any
+
+  if (entity === 'library') {
+    const item = payload?.item as Record<string, unknown> | undefined
+    if (!item) return
+    const contentId = textValue(item.id)
+    const contentType = textValue(item.type)
+    if (deleted) {
+      await db.from('library_items').delete().eq('profile_id', profileId).eq('content_id', contentId).eq('content_type', contentType)
+    } else {
+      const result = await db.from('library_items').upsert(libraryRow(profileId, textValue(payload.status, 'watchlist'), item), { onConflict: 'profile_id,content_id,content_type' })
+      if (result.error) throw result.error
+    }
+    return
+  }
+
+  if (entity === 'watch_progress') {
+    const value = payload as Record<string, unknown>
+    const row = {
+      profile_id: profileId,
+      content_id: textValue(value.contentId),
+      content_type: textValue(value.contentType),
+      video_id: textValue(value.videoId),
+      season: typeof value.season === 'number' ? value.season : null,
+      episode: typeof value.episode === 'number' ? value.episode : null,
+      position: numberValue(value.position),
+      duration: numberValue(value.duration),
+      last_watched: numberValue(value.lastWatched),
+      progress_key: textValue(value.progressKey, change.key),
+      last_audio_language: typeof value.lastAudioLanguage === 'string' ? value.lastAudioLanguage : null,
+      last_subtitle_language: typeof value.lastSubtitleLanguage === 'string' ? value.lastSubtitleLanguage : null,
+      last_stream_index: typeof value.lastStreamIndex === 'number' ? value.lastStreamIndex : null,
+      updated_at: new Date().toISOString(),
+    }
+    if (deleted) {
+      await db.from('watch_progress').delete().eq('profile_id', profileId).eq('progress_key', row.progress_key)
+    } else {
+      const result = await db.from('watch_progress').upsert(row, { onConflict: 'profile_id,progress_key' })
+      if (result.error) throw result.error
+      const event = await db.from('watch_progress_events').insert({ ...row, operation: 'upsert' })
+      if (event.error) throw event.error
+    }
+    return
+  }
+
+  if (entity === 'watched_history') {
+    const value = payload as Record<string, unknown>
+    const row = {
+      profile_id: profileId,
+      content_id: textValue(value.videoId, change.key),
+      content_type: 'unknown',
+      title: '',
+      season: typeof value.season === 'number' ? value.season : null,
+      episode: typeof value.episode === 'number' ? value.episode : null,
+      watched_at: numberValue(value.lastWatched),
+    }
+    if (deleted || value.watched === false) {
+      await db.from('watched_items').delete().eq('profile_id', profileId).eq('content_id', row.content_id).eq('season', row.season).eq('episode', row.episode)
+    } else {
+      const result = await db.from('watched_items').upsert(row, { onConflict: 'profile_id,content_id,content_type,season,episode' })
+      if (result.error) throw result.error
+    }
+    return
+  }
+
+  if (entity === 'addons' && Array.isArray(payload)) {
+    await db.from('addons').delete().eq('profile_id', profileId)
+    const rows = payload.map((addon: any, index: number) => ({
+      profile_id: profileId,
+      url: addon.transportUrl,
+      name: addon.manifest?.name ?? null,
+      enabled: addon.enabled !== false,
+      sort_order: index,
+    }))
+    if (rows.length) {
+      const result = await db.from('addons').insert(rows)
+      if (result.error) throw result.error
+    }
+    return
+  }
+
+  if (entity === 'plugins' && payload && typeof payload === 'object') {
+    await db.from('plugins').delete().eq('profile_id', profileId)
+    const urls = Array.isArray(payload.repositoryUrls) ? payload.repositoryUrls : []
+    if (urls.length) {
+      const rows = urls.map((url: string, index: number) => ({ profile_id: profileId, url, enabled: true, sort_order: index }))
+      const result = await db.from('plugins').insert(rows)
+      if (result.error) throw result.error
+    }
+    return
+  }
+
+  if (entity === 'collections') {
+    const result = await db.from('collections').upsert({ profile_id: profileId, collections_json: payload ?? [], updated_at: new Date().toISOString() }, { onConflict: 'profile_id' })
+    if (result.error) throw result.error
+    return
+  }
+
+  if (entity === 'settings') {
+    const result = await db.from('profile_settings_blobs').upsert({ profile_id: profileId, platform: 'fluxa', settings_json: payload ?? {}, updated_at: new Date().toISOString() }, { onConflict: 'profile_id,platform' })
+    if (result.error) throw result.error
+  }
+}
+
 async function user(request: Request) {
   const token = request.headers.get('authorization')?.replace(/^Bearer\s+/i, '')
   if (!token) return null
@@ -91,6 +343,13 @@ async function syncPull(request: Request, profileId: string, since: number) {
 
 async function syncPush(request: Request) {
   const body = await request.json()
+  if (typeof body.profile_id !== 'string' || !Array.isArray(body.changes) || body.changes.length > 1000) {
+    return response({ error: 'profile_id and at most 1000 changes are required' }, 400)
+  }
+  for (const change of body.changes) {
+    const validationError = validateChange(change)
+    if (validationError) return response({ error: validationError }, 400)
+  }
   if (!await profileOwner(request, body.profile_id)) return response({ error: 'unauthorized' }, 401)
   const profileId = body.profile_id as string
   const profile = await db.from('profiles').select('sync_revision').eq('id', profileId).single()
@@ -99,9 +358,13 @@ async function syncPush(request: Request) {
   const applied = []
   const conflicts = []
   for (const change of body.changes ?? []) {
-    const existing = await db.from('sync_documents').select('revision').eq('profile_id', profileId).eq('document_type', change.entity_type).eq('document_key', change.key).maybeSingle()
+    const existing = await db.from('sync_documents').select('revision,payload,deleted').eq('profile_id', profileId).eq('document_type', change.entity_type).eq('document_key', change.key).maybeSingle()
     if (change.expected_revision !== undefined && (existing.data?.revision ?? 0) !== change.expected_revision) {
       conflicts.push({ entity_type: change.entity_type, key: change.key, expected_revision: change.expected_revision, actual_revision: existing.data?.revision ?? 0 })
+      continue
+    }
+    if (change.entity_type === 'watch_progress' && existing.data?.deleted !== true && shouldThrottleProgress(existing.data?.payload, change.payload)) {
+      applied.push({ entity_type: change.entity_type, key: change.key, revision: existing.data?.revision ?? revision, deleted: false })
       continue
     }
     revision += 1
@@ -110,6 +373,7 @@ async function syncPush(request: Request) {
     const document = await db.from('sync_documents').upsert({ profile_id: profileId, document_type: change.entity_type, document_key: change.key, payload, deleted, revision }, { onConflict: 'profile_id,document_type,document_key' })
     const event = await db.from('sync_events').insert({ profile_id: profileId, entity_type: change.entity_type, document_key: change.key, payload, deleted, revision })
     if (document.error || event.error) return response({ error: 'database error' }, 500)
+    await mirrorDomain(profileId, change)
     applied.push({ entity_type: change.entity_type, key: change.key, revision, deleted })
   }
   const update = await db.from('profiles').update({ sync_revision: revision, updated_at: new Date().toISOString() }).eq('id', profileId)
@@ -126,13 +390,17 @@ async function profiles(request: Request, profileId?: string) {
   }
   if (request.method === 'POST') {
     const body = await request.json()
-    const result = await db.from('profiles').insert({ user_id: current.id, name: body.name, avatar: body.avatar ?? null, settings: body.settings ?? {} }).select('id,name,avatar,settings,updated_at').single()
+    const validationError = validateProfileBody(body)
+    if (validationError) return response({ error: validationError }, 400)
+    const result = await db.from('profiles').insert({ user_id: current.id, name: body.name.trim(), avatar: body.avatar ?? null, settings: body.settings ?? {} }).select('id,name,avatar,settings,updated_at').single()
     return result.error ? response({ error: result.error.message }, 400) : response(result.data, 201)
   }
   if (!profileId || !(await profileOwner(request, profileId))) return response({ error: 'unauthorized' }, 401)
   if (request.method === 'PATCH') {
     const body = await request.json()
-    const result = await db.from('profiles').update({ name: body.name, avatar: body.avatar, settings: body.settings, updated_at: new Date().toISOString() }).eq('id', profileId).select('id,name,avatar,settings,updated_at').single()
+    const validationError = validateProfileBody(body)
+    if (validationError) return response({ error: validationError }, 400)
+    const result = await db.from('profiles').update({ name: body.name.trim(), avatar: body.avatar ?? null, settings: body.settings ?? {}, updated_at: new Date().toISOString() }).eq('id', profileId).select('id,name,avatar,settings,updated_at').single()
     return result.error ? response({ error: 'database error' }, 500) : response(result.data)
   }
   if (request.method === 'DELETE') {

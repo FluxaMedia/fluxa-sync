@@ -1,0 +1,7 @@
+target
+.git
+.env
+supabase/.temp
+docs
+scripts
+*.dump

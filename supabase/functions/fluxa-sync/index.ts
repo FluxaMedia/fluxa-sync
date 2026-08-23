@@ -14,6 +14,7 @@ function response(body: unknown, status = 200) {
 
 const sensitiveField = /^(?:.*(?:access|refresh)[_-]?token|.*(?:api[_-]?key|secret|password|passwd|authorization)|pinHash|nuvioAccessToken|nuvioRefreshToken|stremioToken)$/i
 const entityTypes = new Set(['library', 'watch_progress', 'watched_history', 'collections', 'addons', 'plugins', 'settings'])
+const maxPullChanges = 2000
 
 function sensitivePath(value: unknown, path = 'payload'): string | null {
   if (Array.isArray(value)) {
@@ -115,8 +116,10 @@ function validateEntityPayload(entity: string, payload: unknown): string | null 
   return null
 }
 
-function validateProfileBody(body: Record<string, unknown>): string | null {
-  if (typeof body.name !== 'string' || body.name.trim().length < 1 || body.name.length > 160) return 'profile name is required'
+function validateProfileBody(body: Record<string, unknown>, requireName: boolean): string | null {
+  if (requireName || body.name !== undefined) {
+    if (typeof body.name !== 'string' || body.name.trim().length < 1 || body.name.length > 160) return 'profile name is required'
+  }
   if (body.avatar !== undefined && body.avatar !== null && !validHttpUrl(body.avatar)) return 'profile avatar must be an http(s) URL without credentials'
   const unsafe = sensitivePath(body.settings ?? {}, 'settings')
   return unsafe ? `sensitive field is not allowed: ${unsafe}` : null
@@ -290,18 +293,31 @@ async function mirrorDomain(profileId: string, change: Record<string, any>) {
   }
 }
 
-async function user(request: Request) {
-  const token = request.headers.get('authorization')?.replace(/^Bearer\s+/i, '')
-  if (!token) return null
-  const result = await authClient.auth.getUser(token)
-  return result.data.user ?? null
+const userCache = new Map<string, { account: Record<string, any>; expiresAt: number }>()
+
+function bearer(request: Request) {
+  return request.headers.get('authorization')?.replace(/^Bearer\s+/i, '') ?? null
 }
 
-async function profileOwner(request: Request, profileId: string) {
+async function user(request: Request) {
+  const token = bearer(request)
+  if (!token) return null
+  const cached = userCache.get(token)
+  if (cached && cached.expiresAt > Date.now()) return cached.account
+  const result = await authClient.auth.getUser(token)
+  const account = result.data.user ?? null
+  if (account) {
+    if (userCache.size > 500) userCache.clear()
+    userCache.set(token, { account, expiresAt: Date.now() + 60_000 })
+  }
+  return account
+}
+
+async function profileContext(request: Request, profileId: string) {
   const current = await user(request)
-  if (!current) return null
-  const result = await db.from('profiles').select('id').eq('id', profileId).eq('user_id', current.id).maybeSingle()
-  return result.data ? current : null
+  if (!current || typeof profileId !== 'string') return null
+  const result = await db.from('profiles').select('id,sync_revision').eq('id', profileId).eq('user_id', current.id).maybeSingle()
+  return result.data ? { account: current, cursor: result.data.sync_revision as number } : null
 }
 
 function sessionBody(data: Record<string, any>) {
@@ -337,25 +353,35 @@ async function auth(request: Request, action: string) {
     return result.error ? result : { data: sessionBody(result.data), error: null }
   }
   if (action === 'logout') {
-    const result = await authClient.auth.signOut()
+    const token = bearer(request)
+    if (!token) return { data: null, error: { message: 'unauthorized' } }
+    userCache.delete(token)
+    const result = await db.auth.admin.signOut(token, 'global')
     return { data: {}, error: result.error }
   }
   return null
 }
 
 async function syncSnapshot(request: Request, profileId: string) {
-  if (!await profileOwner(request, profileId)) return response({ error: 'unauthorized' }, 401)
-  const [documents, profile, library, progress, history] = await Promise.all([
-    db.from('sync_documents').select('document_type,document_key,payload,deleted,revision,updated_at').eq('profile_id', profileId).order('revision'),
-    db.from('profiles').select('sync_revision').eq('id', profileId).single(),
+  const context = await profileContext(request, profileId)
+  if (!context) return response({ error: 'unauthorized' }, 401)
+  const [library, progress, history] = await Promise.all([
     db.from('library_items').select('*').eq('profile_id', profileId),
     db.from('watch_progress').select('*').eq('profile_id', profileId),
     db.from('watched_items').select('*').eq('profile_id', profileId),
   ])
-  if (documents.error || profile.error || library.error || progress.error || history.error) return response({ error: 'database error' }, 500)
+  if (library.error || progress.error || history.error) return response({ error: 'database error' }, 500)
 
-  const cursor = profile.data.sync_revision
-  const generic = documents.data ?? []
+  const cursor = context.cursor
+  const mirrored: string[] = []
+  if (library.data?.length) mirrored.push('library')
+  if (progress.data?.length) mirrored.push('watch_progress')
+  if (history.data?.length) mirrored.push('watched_history')
+  let genericQuery = db.from('sync_documents').select('document_type,document_key,payload,deleted,revision,updated_at').eq('profile_id', profileId).order('revision')
+  if (mirrored.length) genericQuery = genericQuery.not('document_type', 'in', `(${mirrored.join(',')})`)
+  const documents = await genericQuery
+  if (documents.error) return response({ error: 'database error' }, 500)
+  const generic: Record<string, any>[] = documents.data ?? []
   const typedEntities = new Set<string>()
   const typedDocuments: any[] = []
   const appendTyped = (entity_type: string, document_key: string, payload: unknown) => {
@@ -409,8 +435,6 @@ async function syncSnapshot(request: Request, profileId: string) {
     })
   }
 
-  // Older profiles may predate the typed mirror. Keep their generic documents
-  // until the next successful write hydrates the domain tables.
   const documentsForSnapshot = [
     ...generic.filter((document) => !typedEntities.has(document.document_type)),
     ...typedDocuments,
@@ -419,17 +443,19 @@ async function syncSnapshot(request: Request, profileId: string) {
 }
 
 async function syncPull(request: Request, profileId: string, since: number) {
-  if (!await profileOwner(request, profileId)) return response({ error: 'unauthorized' }, 401)
-  const [events, profile, minimum] = await Promise.all([
-    db.from('sync_events').select('entity_type,document_key,payload,deleted,revision,created_at').eq('profile_id', profileId).gt('revision', since).order('revision'),
-    db.from('profiles').select('sync_revision').eq('id', profileId).single(),
+  const context = await profileContext(request, profileId)
+  if (!context) return response({ error: 'unauthorized' }, 401)
+  const [events, minimum] = await Promise.all([
+    db.from('sync_events').select('entity_type,document_key,payload,deleted,revision,created_at').eq('profile_id', profileId).gt('revision', since).order('revision').limit(maxPullChanges),
     db.from('sync_events').select('revision').eq('profile_id', profileId).order('revision').limit(1).maybeSingle(),
   ])
-  if (events.error || profile.error || minimum.error) return response({ error: 'database error' }, 500)
+  if (events.error || minimum.error) return response({ error: 'database error' }, 500)
   const minRevision = minimum.data?.revision ?? null
-  const cursor = profile.data.sync_revision
-  const reset = since > 0 && (minRevision === null ? since < cursor : since < minRevision - 1)
-  return response({ profile_id: profileId, since, cursor, minimum_available_revision: minRevision, reset_required: reset, changes: events.data })
+  const changes = events.data ?? []
+  const truncated = changes.length === maxPullChanges
+  const cursor = truncated ? changes[changes.length - 1].revision : context.cursor
+  const reset = since > 0 && (minRevision === null ? since < context.cursor : since < minRevision - 1)
+  return response({ profile_id: profileId, since, cursor, minimum_available_revision: minRevision, reset_required: reset, has_more: truncated, changes })
 }
 
 async function syncPush(request: Request) {
@@ -437,18 +463,17 @@ async function syncPush(request: Request) {
   if (typeof body.profile_id !== 'string' || !Array.isArray(body.changes) || body.changes.length > 1000) {
     return response({ error: 'profile_id and at most 1000 changes are required' }, 400)
   }
+  const context = await profileContext(request, body.profile_id)
+  if (!context) return response({ error: 'unauthorized' }, 401)
   for (const change of body.changes) {
     const validationError = validateChange(change)
     if (validationError) return response({ error: validationError }, 400)
   }
-  if (!await profileOwner(request, body.profile_id)) return response({ error: 'unauthorized' }, 401)
   const profileId = body.profile_id as string
   const limit = await db.rpc('sync_check_rate_limit', { p_profile_id: profileId, p_max_requests: 120 })
   if (limit.error) return response({ error: 'database error' }, 500)
   if (limit.data === false) return response({ error: 'rate limit exceeded' }, 429)
-  const profile = await db.from('profiles').select('sync_revision').eq('id', profileId).single()
-  if (profile.error) return response({ error: 'database error' }, 500)
-  let revision = profile.data.sync_revision as number
+  let revision = context.cursor
   const changes = body.changes ?? []
   const results: ({ kind: 'applied' | 'conflict'; value: Record<string, unknown> } | null)[] = new Array(changes.length).fill(null)
   let databaseError = false
@@ -461,22 +486,33 @@ async function syncPush(request: Request) {
     groups.set(groupKey, indexes)
   })
 
-  await Promise.all([...groups.values()].map(async (indexes) => {
+  const current = new Map<string, { revision: number; payload: unknown; deleted: boolean }>()
+  if (changes.length) {
+    const prefetch = await db.from('sync_documents').select('document_type,document_key,revision,payload,deleted')
+      .eq('profile_id', profileId)
+      .in('document_type', [...new Set(changes.map((change: Record<string, unknown>) => change.entity_type as string))])
+      .in('document_key', [...new Set(changes.map((change: Record<string, unknown>) => change.key as string))])
+    if (prefetch.error) return response({ error: 'database error' }, 500)
+    for (const row of prefetch.data ?? []) {
+      current.set(`${row.document_type} ${row.document_key}`, { revision: row.revision, payload: row.payload, deleted: row.deleted })
+    }
+  }
+
+  await Promise.all([...groups.entries()].map(async ([groupKey, indexes]) => {
     for (const index of indexes) {
       if (databaseError) return
       const change = changes[index]
-      const existing = await db.from('sync_documents').select('revision,payload,deleted').eq('profile_id', profileId).eq('document_type', change.entity_type).eq('document_key', change.key).maybeSingle()
-      if (existing.error) { databaseError = true; return }
-      if (change.expected_revision !== undefined && (existing.data?.revision ?? 0) !== change.expected_revision) {
-        results[index] = { kind: 'conflict', value: { entity_type: change.entity_type, key: change.key, expected_revision: change.expected_revision, actual_revision: existing.data?.revision ?? 0 } }
+      const existing = current.get(groupKey) ?? null
+      if (change.expected_revision !== undefined && (existing?.revision ?? 0) !== change.expected_revision) {
+        results[index] = { kind: 'conflict', value: { entity_type: change.entity_type, key: change.key, expected_revision: change.expected_revision, actual_revision: existing?.revision ?? 0 } }
         continue
       }
-      if (existing.data && existing.data.deleted === (change.deleted === true) && samePayload(existing.data.payload, change.payload ?? null)) {
-        results[index] = { kind: 'applied', value: { entity_type: change.entity_type, key: change.key, revision: existing.data.revision, deleted: change.deleted === true } }
+      if (existing && existing.deleted === (change.deleted === true) && samePayload(existing.payload, change.payload ?? null)) {
+        results[index] = { kind: 'applied', value: { entity_type: change.entity_type, key: change.key, revision: existing.revision, deleted: change.deleted === true } }
         continue
       }
-      if (change.entity_type === 'watch_progress' && existing.data?.deleted !== true && shouldThrottleProgress(existing.data?.payload, change.payload)) {
-        results[index] = { kind: 'applied', value: { entity_type: change.entity_type, key: change.key, revision: existing.data?.revision ?? revision, deleted: false } }
+      if (change.entity_type === 'watch_progress' && existing?.deleted !== true && shouldThrottleProgress(existing?.payload, change.payload)) {
+        results[index] = { kind: 'applied', value: { entity_type: change.entity_type, key: change.key, revision: existing?.revision ?? revision, deleted: false } }
         continue
       }
       revision += 1
@@ -495,6 +531,7 @@ async function syncPush(request: Request) {
       const parsedRevision = Number(appliedChange.data)
       const appliedRevision = Number.isSafeInteger(parsedRevision) ? parsedRevision : requestedRevision
       revision = Math.max(revision, appliedRevision)
+      current.set(groupKey, { revision: appliedRevision, payload, deleted })
       results[index] = { kind: 'applied', value: { entity_type: change.entity_type, key: change.key, revision: appliedRevision, deleted } }
     }
   }))
@@ -520,17 +557,24 @@ async function profiles(request: Request, profileId?: string) {
   }
   if (request.method === 'POST') {
     const body = await request.json()
-    const validationError = validateProfileBody(body)
+    const validationError = validateProfileBody(body, true)
     if (validationError) return response({ error: validationError }, 400)
+    const owned = await db.from('profiles').select('id', { count: 'exact', head: true }).eq('user_id', current.id)
+    if (owned.error) return response({ error: 'database error' }, 500)
+    if ((owned.count ?? 0) >= 32) return response({ error: 'profile limit reached' }, 400)
     const result = await db.from('profiles').insert({ user_id: current.id, name: body.name.trim(), avatar: body.avatar ?? null, settings: body.settings ?? {} }).select('id,name,avatar,settings,updated_at').single()
     return result.error ? response({ error: result.error.message }, 400) : response(result.data, 201)
   }
-  if (!profileId || !(await profileOwner(request, profileId))) return response({ error: 'unauthorized' }, 401)
+  if (!profileId || !(await profileContext(request, profileId))) return response({ error: 'unauthorized' }, 401)
   if (request.method === 'PATCH') {
     const body = await request.json()
-    const validationError = validateProfileBody(body)
+    const validationError = validateProfileBody(body, false)
     if (validationError) return response({ error: validationError }, 400)
-    const result = await db.from('profiles').update({ name: body.name.trim(), avatar: body.avatar ?? null, settings: body.settings ?? {}, updated_at: new Date().toISOString() }).eq('id', profileId).select('id,name,avatar,settings,updated_at').single()
+    const patch: Record<string, unknown> = { updated_at: new Date().toISOString() }
+    if (body.name !== undefined) patch.name = body.name.trim()
+    if (body.avatar !== undefined) patch.avatar = body.avatar ?? null
+    if (body.settings !== undefined) patch.settings = body.settings ?? {}
+    const result = await db.from('profiles').update(patch).eq('id', profileId).select('id,name,avatar,settings,updated_at').single()
     return result.error ? response({ error: 'database error' }, 500) : response(result.data)
   }
   if (request.method === 'DELETE') {

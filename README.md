@@ -46,6 +46,10 @@ POST /api/v1/auth/login
 POST /api/v1/auth/refresh
 POST /api/v1/auth/logout
 GET  /api/v1/auth/me
+POST /api/v1/auth/device/start
+POST /api/v1/auth/device/approve
+POST /api/v1/auth/device/exchange
+GET  /tv-login?code=<user_code>
 GET  /api/v1/profiles
 POST /api/v1/profiles
 GET  /api/v1/sync/snapshot?profile_id=<uuid>
@@ -94,6 +98,8 @@ Both deployment modes fit the free tier if a few things are set correctly:
 - **Connection limits**: if you point the standalone Rust server's `DATABASE_URL` at a Supabase free-tier project, use the pooled connection string (port `6543`, transaction mode) rather than the direct one (port `5432`) — the free tier's direct-connection quota is small. When using the transaction pooler, set `DATABASE_DISABLE_STATEMENT_CACHE=1`; pgbouncer in transaction mode doesn't guarantee the same backend connection across statements, so sqlx's prepared-statement cache must be off. Keep `DATABASE_MAX_CONNECTIONS` modest (default 10) — a handful of pooled connections comfortably serves thousands of users since each request only holds one for the duration of its query.
 - **Edge function invocations**: `sync/push` reads every document a request touches in one query rather than one round trip per change, and batches distinct keys concurrently, which keeps large pushes well under the function's wall-time budget. Access tokens are resolved against Supabase Auth at most once a minute per token instead of once per request. The standalone server collapses a push into two multi-row inserts regardless of how many changes it carries.
 - **Egress (5GB/month)**: `sync/pull` returns at most 2000 events per call and sets `has_more` when it truncates, moving the cursor to the last event it returned. `sync/snapshot` no longer downloads generic documents for entities the typed tables already mirror.
+
+Set `PUBLIC_BASE_URL` to the HTTPS public API origin in production so QR codes open the correct approval page. `DEVICE_LOGIN_URL` can override the generated `/tv-login?code=...` URL when a separate web frontend is deployed. `DEVICE_REQUESTS_PER_MINUTE` controls the TV polling budget and defaults to 120.
 
 ## Backups
 

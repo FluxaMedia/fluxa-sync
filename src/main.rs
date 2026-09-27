@@ -1,5 +1,5 @@
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
-use axum::{Json, Router, extract::{ConnectInfo, DefaultBodyLimit, Query, Request, State, WebSocketUpgrade, ws::Message}, http::{HeaderMap, StatusCode, header}, middleware::{self, Next}, response::{IntoResponse, Response}, routing::{get, patch, post}};
+use axum::{Json, Router, extract::{ConnectInfo, DefaultBodyLimit, Query, Request, State, WebSocketUpgrade, ws::Message}, http::{HeaderMap, StatusCode, header}, middleware::{self, Next}, response::{Html, IntoResponse, Response}, routing::{get, patch, post}};
 use futures_util::{SinkExt, StreamExt};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use rand_core::OsRng;
@@ -18,6 +18,8 @@ const MAX_KEY_BYTES: usize = 512;
 const MAX_PAYLOAD_BYTES: usize = 512_000;
 const MAX_PULL_CHANGES: usize = 2000;
 const MAX_PROFILES_PER_USER: i64 = 32;
+const DEVICE_LOGIN_TTL_SECONDS: i64 = 300;
+const DEVICE_CODE_LENGTH: usize = 8;
 
 #[derive(Clone)]
 struct SyncNotification {
@@ -31,6 +33,7 @@ struct AppState {
     jwt_secret: Arc<String>,
     events: broadcast::Sender<SyncNotification>,
     auth_limiter: Arc<RateLimiter>,
+    device_limiter: Arc<RateLimiter>,
     sync_limiter: Arc<RateLimiter>,
     access_token_ttl: i64,
     trust_proxy_headers: bool,
@@ -96,6 +99,22 @@ struct RefreshRequest {
 }
 
 #[derive(Deserialize)]
+struct DeviceStartRequest {
+    device_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DeviceCodeRequest {
+    code: String,
+}
+
+#[derive(Deserialize)]
+struct DevicePollRequest {
+    session_id: Uuid,
+    poll_secret: String,
+}
+
+#[derive(Deserialize)]
 struct CreateProfile {
     name: String,
     avatar: Option<String>,
@@ -134,6 +153,20 @@ fn hash_refresh_token(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn device_code() -> String {
+    Uuid::new_v4().simple().to_string()[..DEVICE_CODE_LENGTH].to_ascii_uppercase()
+}
+
+fn device_login_url(code: &str) -> String {
+    let base = env::var("DEVICE_LOGIN_URL").unwrap_or_else(|_| format!("{}/tv-login", env::var("PUBLIC_BASE_URL").unwrap_or_else(|_| "http://localhost:8080".into()).trim_end_matches('/')));
+    format!("{}{}code={}", base, if base.contains('?') { '&' } else { '?' }, code)
+}
+
+async fn device_login_page(Query(query): Query<HashMap<String, String>>) -> Html<String> {
+    let code = query.get("code").map(String::as_str).unwrap_or("");
+    Html(format!(r#"<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Fluxa TV Login</title><style>body{{font:16px system-ui;background:#111;color:#fff;display:grid;place-items:center;min-height:100vh;margin:0}}main{{width:min(420px,calc(100% - 40px));background:#222;padding:28px;border-radius:16px}}input,button{{box-sizing:border-box;width:100%;padding:14px;margin-top:12px;border-radius:8px;border:1px solid #555;background:#111;color:#fff}}button{{background:#7c4dff;border:0;font-weight:700}}#message{{min-height:24px;margin-top:16px;color:#bbb}}</style></head><body><main><h1>Sign in to Fluxa TV</h1><p>Enter your Fluxa account details to connect this TV.</p><form id="form"><input id="email" type="email" autocomplete="email" placeholder="Email" required><input id="password" type="password" autocomplete="current-password" placeholder="Password" required><button>Connect TV</button></form><div id="message"></div></main><script>const code={0};const form=document.querySelector('#form');const message=document.querySelector('#message');form.addEventListener('submit',async event=>{{event.preventDefault();message.textContent='Connecting…';try{{const login=await fetch('/api/v1/auth/login',{{method:'POST',headers:{{'content-type':'application/json'}},body:JSON.stringify({{email:email.value,password:password.value}})}});if(!login.ok)throw new Error('Invalid email or password');const body=await login.json();const approved=await fetch('/api/v1/auth/device/approve',{{method:'POST',headers:{{'content-type':'application/json',authorization:'Bearer '+body.access_token}},body:JSON.stringify({{code}})}});if(!approved.ok)throw new Error('This TV code expired');form.hidden=true;message.textContent='TV connected. You can return to the app.'}}catch(error){{message.textContent=error.message}}}});</script></body></html>"#, serde_json::to_string(code).unwrap_or_else(|_| "\"\"".into())))
 }
 
 fn sensitive_key(key: &str) -> bool {
@@ -384,6 +417,14 @@ async fn throttle_auth(State(state): State<AppState>, ConnectInfo(peer): Connect
     next.run(request).await
 }
 
+async fn throttle_device(State(state): State<AppState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, request: Request, next: Next) -> Response {
+    let address = client_address(request.headers(), peer, state.trust_proxy_headers);
+    if !state.device_limiter.allow(&address) {
+        return ApiError::throttled().into_response();
+    }
+    next.run(request).await
+}
+
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let database = if sqlx::query("select 1").execute(&state.db).await.is_ok() { "ok" } else { "error" };
     (StatusCode::OK, Json(Health { status: "ok", database }))
@@ -415,6 +456,41 @@ async fn login(State(state): State<AppState>, Json(input): Json<Credentials>) ->
     Argon2::default().verify_password(input.password.as_bytes(), &parsed).map_err(|_| ApiError::unauthorized())?;
     let user_id: Uuid = row.try_get("id").map_err(ApiError::internal)?;
     session(&state, user_id, row.try_get::<String, _>("email").map_err(ApiError::internal)?, row.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at").map_err(ApiError::internal)?).await
+}
+
+async fn device_start(State(state): State<AppState>, Json(input): Json<DeviceStartRequest>) -> Result<Json<Value>, ApiError> {
+    sqlx::query("delete from device_login_sessions where expires_at < now() - interval '1 hour'").execute(&state.db).await.map_err(ApiError::internal)?;
+    let code = device_code();
+    let poll_secret = Uuid::new_v4().simple().to_string();
+    let session_id = Uuid::new_v4();
+    let device_name = input.device_name.map(|name| name.trim().chars().take(120).collect::<String>()).filter(|name| !name.is_empty());
+    sqlx::query("insert into device_login_sessions (id, code_hash, poll_secret_hash, device_name, expires_at) values ($1, $2, $3, $4, now() + ($5::double precision * interval '1 second'))")
+        .bind(session_id).bind(hash_refresh_token(&code)).bind(hash_refresh_token(&poll_secret)).bind(&device_name).bind(DEVICE_LOGIN_TTL_SECONDS)
+        .execute(&state.db).await.map_err(ApiError::internal)?;
+    Ok(Json(json!({"session_id": session_id, "user_code": code, "verification_uri": device_login_url(&code), "poll_secret": poll_secret, "expires_in": DEVICE_LOGIN_TTL_SECONDS, "poll_interval": 5})))
+}
+
+async fn device_approve(State(state): State<AppState>, headers: HeaderMap, Json(input): Json<DeviceCodeRequest>) -> Result<StatusCode, ApiError> {
+    let user_id = authenticated_user(&headers, &state.jwt_secret)?;
+    let code = input.code.trim().to_ascii_uppercase();
+    if code.len() != DEVICE_CODE_LENGTH || !code.bytes().all(|byte| byte.is_ascii_alphanumeric()) { return Err(ApiError::bad_request("invalid device code")); }
+    let result = sqlx::query("update device_login_sessions set approved_user_id = $1, approved_at = now() where code_hash = $2 and approved_user_id is null and consumed_at is null and expires_at > now()")
+        .bind(user_id).bind(hash_refresh_token(&code)).execute(&state.db).await.map_err(ApiError::internal)?;
+    if result.rows_affected() == 0 { return Err(ApiError::bad_request("device code is invalid or expired")); }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn device_exchange(State(state): State<AppState>, Json(input): Json<DevicePollRequest>) -> Result<Json<Value>, ApiError> {
+    let mut transaction = state.db.begin().await.map_err(ApiError::internal)?;
+    let row = sqlx::query("select approved_user_id, expires_at, consumed_at from device_login_sessions where id = $1 and poll_secret_hash = $2 for update")
+        .bind(input.session_id).bind(hash_refresh_token(&input.poll_secret)).fetch_optional(&mut *transaction).await.map_err(ApiError::internal)?.ok_or_else(ApiError::unauthorized)?;
+    if row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("consumed_at").map_err(ApiError::internal)?.is_some() { return Err(ApiError::bad_request("device session already consumed")); }
+    if row.try_get::<chrono::DateTime<chrono::Utc>, _>("expires_at").map_err(ApiError::internal)? <= chrono::Utc::now() { return Ok(Json(json!({"status": "expired"}))); }
+    let Some(user_id) = row.try_get::<Option<Uuid>, _>("approved_user_id").map_err(ApiError::internal)? else { return Ok(Json(json!({"status": "pending"}))); };
+    sqlx::query("update device_login_sessions set consumed_at = now() where id = $1").bind(input.session_id).execute(&mut *transaction).await.map_err(ApiError::internal)?;
+    transaction.commit().await.map_err(ApiError::internal)?;
+    let user = sqlx::query("select email, created_at from users where id = $1").bind(user_id).fetch_one(&state.db).await.map_err(ApiError::internal)?;
+    session(&state, user_id, user.try_get("email").map_err(ApiError::internal)?, user.try_get("created_at").map_err(ApiError::internal)?).await
 }
 
 async fn refresh(State(state): State<AppState>, Json(input): Json<RefreshRequest>) -> Result<Json<Value>, ApiError> {
@@ -670,12 +746,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (events, _) = broadcast::channel(256);
     let access_token_ttl = env::var("ACCESS_TOKEN_TTL_SECONDS").ok().and_then(|value| value.parse::<i64>().ok()).unwrap_or(3600).clamp(300, 86_400);
     let auth_rate = env::var("AUTH_REQUESTS_PER_MINUTE").ok().and_then(|value| value.parse::<f64>().ok()).unwrap_or(10.0).max(1.0);
+    let device_rate = env::var("DEVICE_REQUESTS_PER_MINUTE").ok().and_then(|value| value.parse::<f64>().ok()).unwrap_or(120.0).max(1.0);
     let sync_rate = env::var("SYNC_REQUESTS_PER_MINUTE").ok().and_then(|value| value.parse::<f64>().ok()).unwrap_or(120.0).max(1.0);
     let state = AppState {
         db,
         jwt_secret: Arc::new(jwt_secret),
         events,
         auth_limiter: Arc::new(RateLimiter::new(auth_rate / 60.0, auth_rate)),
+        device_limiter: Arc::new(RateLimiter::new(device_rate / 60.0, device_rate)),
         sync_limiter: Arc::new(RateLimiter::new(sync_rate / 60.0, sync_rate)),
         access_token_ttl,
         trust_proxy_headers: env::var("TRUST_PROXY_HEADERS").map(|value| value == "1" || value.eq_ignore_ascii_case("true")).unwrap_or(false),
@@ -701,8 +779,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/auth/login", post(login))
         .route("/api/v1/auth/refresh", post(refresh))
         .layer(middleware::from_fn_with_state(state.clone(), throttle_auth));
+    let device = Router::new()
+        .route("/api/v1/auth/device/start", post(device_start))
+        .route("/api/v1/auth/device/approve", post(device_approve))
+        .route("/api/v1/auth/device/exchange", post(device_exchange))
+        .layer(middleware::from_fn_with_state(state.clone(), throttle_device));
     let app = Router::new()
         .route("/health", get(health))
+        .route("/tv-login", get(device_login_page))
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/me", get(me))
         .route("/api/v1/profiles", get(profiles).post(create_profile))
@@ -712,6 +796,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/v1/sync/push", post(push).layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
         .route("/api/v1/realtime", get(realtime))
         .merge(auth)
+        .merge(device)
         .layer(cors)
         .with_state(state);
     let address: SocketAddr = format!("{}:{}", env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0".into()), env::var("PORT").unwrap_or_else(|_| "8080".into())).parse()?;

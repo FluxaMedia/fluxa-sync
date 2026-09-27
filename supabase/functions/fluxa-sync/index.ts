@@ -15,6 +15,33 @@ function response(body: unknown, status = 200) {
 const sensitiveField = /^(?:.*(?:access|refresh)[_-]?token|.*(?:api[_-]?key|secret|password|passwd|authorization)|pinHash|nuvioAccessToken|nuvioRefreshToken|stremioToken)$/i
 const entityTypes = new Set(['library', 'watch_progress', 'watched_history', 'collections', 'addons', 'plugins', 'settings'])
 const maxPullChanges = 2000
+const deviceLoginTtlSeconds = 300
+const deviceStartsPerMinute = 10
+
+async function sha256Hex(value: string) {
+  const bytes = new TextEncoder().encode(value)
+  const digest = await crypto.subtle.digest('SHA-256', bytes)
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+function deviceCode() {
+  const bytes = crypto.getRandomValues(new Uint8Array(5))
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('').slice(0, 8).toUpperCase()
+}
+
+function deviceLoginUrl(code: string) {
+  const base = Deno.env.get('DEVICE_LOGIN_URL') ?? `${Deno.env.get('PUBLIC_BASE_URL') ?? 'http://localhost:54321/functions/v1/fluxa-sync'}/tv-login`
+  return `${base}${base.includes('?') ? '&' : '?'}code=${encodeURIComponent(code)}`
+}
+
+function deviceLoginPage(request: Request) {
+  const url = new URL(request.url)
+  const code = url.searchParams.get('code')?.trim().toUpperCase() ?? ''
+  const apiRoot = url.pathname.replace(/\/tv-login\/?$/, '')
+  const safeCode = JSON.stringify(code).replace(/</g, '\\u003c')
+  const html = `<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connect Fluxa TV</title><style>body{font:16px system-ui;background:#101010;color:#fff;max-width:420px;margin:10vh auto;padding:24px}input,button{box-sizing:border-box;width:100%;padding:14px;margin:6px 0;border-radius:8px;border:1px solid #555;background:#191919;color:#fff}button{background:#fff;color:#111;font-weight:700}#message{margin-top:16px}</style><h1>Connect Fluxa TV</h1><p>Enter your Fluxa account to connect this TV.</p><form id="form"><input id="email" type="email" autocomplete="email" placeholder="Email" required><input id="password" type="password" autocomplete="current-password" placeholder="Password" required><button>Connect TV</button></form><div id="message"></div><script>const code=${safeCode},root=${JSON.stringify(apiRoot)};const message=document.querySelector('#message');document.querySelector('#form').addEventListener('submit',async event=>{event.preventDefault();message.textContent='Connecting…';try{const login=await fetch(root+'/api/v1/auth/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:email.value,password:password.value})});const auth=await login.json();const token=auth.data?.access_token;if(!login.ok||!token)throw Error(auth.error||'Login failed');const approve=await fetch(root+'/api/v1/auth/device/approve',{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer '+token},body:JSON.stringify({code})});if(!approve.ok)throw Error('Code expired or invalid');form.remove();message.textContent='TV connected. You can close this page.'}catch(error){message.textContent=error.message||'Could not connect TV'}}</script>`
+  return new Response(html, { status: 200, headers: { ...cors, 'content-type': 'text/html; charset=utf-8' } })
+}
 
 function sensitivePath(value: unknown, path = 'payload'): string | null {
   if (Array.isArray(value)) {
@@ -362,6 +389,66 @@ async function auth(request: Request, action: string) {
   return null
 }
 
+async function deviceAuth(request: Request, action: string) {
+  if (action === 'start' && request.method === 'POST') {
+    const clientIp = request.headers.get('x-forwarded-for')?.split(',')[0].trim() || null
+    if (clientIp) {
+      const recent = await db.from('device_login_sessions').select('id', { count: 'exact', head: true })
+        .eq('client_ip', clientIp).gt('created_at', new Date(Date.now() - 60_000).toISOString())
+      if (recent.error) return response({ error: 'database error' }, 500)
+      if ((recent.count ?? 0) >= deviceStartsPerMinute) return response({ error: 'too many requests' }, 429)
+    }
+    const body = await request.json().catch(() => ({}))
+    const code = deviceCode()
+    const pollSecret = crypto.randomUUID().replaceAll('-', '')
+    const sessionId = crypto.randomUUID()
+    const result = await db.from('device_login_sessions').insert({
+      id: sessionId,
+      code_hash: await sha256Hex(code),
+      poll_secret_hash: await sha256Hex(pollSecret),
+      client_ip: clientIp,
+      device_name: typeof body.device_name === 'string' ? body.device_name.trim().slice(0, 120) || null : null,
+      expires_at: new Date(Date.now() + deviceLoginTtlSeconds * 1000).toISOString(),
+    })
+    if (result.error) return response({ error: 'database error' }, 500)
+    return response({ session_id: sessionId, user_code: code, verification_uri: deviceLoginUrl(code), poll_secret: pollSecret, expires_in: deviceLoginTtlSeconds, poll_interval: 5 })
+  }
+
+  if (action === 'approve' && request.method === 'POST') {
+    const current = await user(request)
+    if (!current) return response({ error: 'unauthorized' }, 401)
+    const body = await request.json().catch(() => ({}))
+    const code = typeof body.code === 'string' ? body.code.trim().toUpperCase() : ''
+    if (!/^[A-Z0-9]{8}$/.test(code)) return response({ error: 'invalid device code' }, 400)
+    const result = await db.from('device_login_sessions').update({ approved_user_id: current.id, approved_at: new Date().toISOString() })
+      .eq('code_hash', await sha256Hex(code)).is('approved_user_id', null).is('consumed_at', null).gt('expires_at', new Date().toISOString())
+      .select('id', { count: 'exact', head: true })
+    return result.error ? response({ error: 'database error' }, 500) : new Response(null, { status: result.count === 0 ? 400 : 204, headers: cors })
+  }
+
+  const body = await request.json().catch(() => ({}))
+  const sessionId = typeof body.session_id === 'string' ? body.session_id : ''
+  const pollSecret = typeof body.poll_secret === 'string' ? body.poll_secret : ''
+  const session = await db.from('device_login_sessions').select('approved_user_id,expires_at,consumed_at').eq('id', sessionId).eq('poll_secret_hash', await sha256Hex(pollSecret)).maybeSingle()
+  if (session.error || !session.data) return response({ error: 'unauthorized' }, 401)
+  if (session.data.consumed_at) return response({ error: 'device session already consumed' }, 400)
+  if (new Date(session.data.expires_at).getTime() <= Date.now()) return response({ status: 'expired' })
+  if (action !== 'exchange' || !session.data.approved_user_id) return response({ status: 'pending' })
+
+  const account = await db.auth.admin.getUserById(session.data.approved_user_id)
+  const email = account.data.user?.email
+  if (account.error || !email) return response({ error: 'account unavailable' }, 500)
+  const link = await db.auth.admin.generateLink({ type: 'magiclink', email })
+  const properties = link.data?.properties as Record<string, unknown> | undefined
+  const tokenHash = properties?.hashed_token
+  if (link.error || typeof tokenHash !== 'string') return response({ error: 'could not create device session' }, 500)
+  const verified = await authClient.auth.verifyOtp({ type: 'magiclink', token_hash: tokenHash })
+  if (verified.error || !verified.data.session) return response({ error: 'could not create device session' }, 500)
+  const consumed = await db.from('device_login_sessions').update({ consumed_at: new Date().toISOString() }).eq('id', sessionId).is('consumed_at', null)
+  if (consumed.error) return response({ error: 'database error' }, 500)
+  return response({ status: 'authorized', ...sessionBody(verified.data) })
+}
+
 async function syncSnapshot(request: Request, profileId: string) {
   const context = await profileContext(request, profileId)
   if (!context) return response({ error: 'unauthorized' }, 401)
@@ -589,11 +676,13 @@ Deno.serve(async (request) => {
   const url = new URL(request.url)
   const parts = url.pathname.split('/').filter(Boolean)
   try {
+    if (parts.at(-1) === 'tv-login' && request.method === 'GET') return deviceLoginPage(request)
     if (parts.at(-2) === 'auth') {
       const result = await auth(request, parts.at(-1)!)
       if (!result || result.error) return response({ error: result?.error?.message ?? 'unsupported auth action' }, 400)
       return response(result.data)
     }
+    if (parts.at(-2) === 'device') return deviceAuth(request, parts.at(-1)!)
     if (parts.at(-2) === 'sync' && parts.at(-1) === 'snapshot') return syncSnapshot(request, new URL(request.url).searchParams.get('profile_id')!)
     if (parts.at(-2) === 'sync' && parts.at(-1) === 'pull') return syncPull(request, new URL(request.url).searchParams.get('profile_id')!, Number(new URL(request.url).searchParams.get('since') ?? 0))
     if (parts.at(-2) === 'sync' && parts.at(-1) === 'push') return syncPush(request)

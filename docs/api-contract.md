@@ -8,6 +8,10 @@ POST /api/v1/auth/login
 POST /api/v1/auth/refresh
 POST /api/v1/auth/logout
 GET  /api/v1/auth/me
+POST /api/v1/auth/device/start
+POST /api/v1/auth/device/approve
+POST /api/v1/auth/device/exchange
+GET  /tv-login?code=<user_code>
 GET  /api/v1/profiles
 POST /api/v1/profiles
 PATCH /api/v1/profiles/:profile_id
@@ -18,4 +22,3 @@ POST /api/v1/sync/push
 ```
 
 The sync document model is shared: `entity_type`, stable `key`, JSON `payload`, `deleted`, and monotonically increasing profile revisions. Clients must handle `reset_required` by replacing local state from the snapshot cursor.
-

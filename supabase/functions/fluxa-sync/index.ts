@@ -39,7 +39,7 @@ function deviceLoginPage(request: Request) {
   const code = url.searchParams.get('code')?.trim().toUpperCase() ?? ''
   const apiRoot = url.pathname.replace(/\/tv-login\/?$/, '')
   const safeCode = JSON.stringify(code).replace(/</g, '\\u003c')
-  const html = `<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connect Fluxa TV</title><style>body{font:16px system-ui;background:#101010;color:#fff;max-width:420px;margin:10vh auto;padding:24px}input,button{box-sizing:border-box;width:100%;padding:14px;margin:6px 0;border-radius:8px;border:1px solid #555;background:#191919;color:#fff}button{background:#fff;color:#111;font-weight:700}#message{margin-top:16px}</style><h1>Connect Fluxa TV</h1><p>Enter your Fluxa account to connect this TV.</p><form id="form"><input id="email" type="email" autocomplete="email" placeholder="Email" required><input id="password" type="password" autocomplete="current-password" placeholder="Password" required><button>Connect TV</button></form><div id="message"></div><script>const code=${safeCode},root=${JSON.stringify(apiRoot)};const message=document.querySelector('#message');document.querySelector('#form').addEventListener('submit',async event=>{event.preventDefault();message.textContent='Connecting…';try{const login=await fetch(root+'/api/v1/auth/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:email.value,password:password.value})});const auth=await login.json();const token=auth.data?.access_token;if(!login.ok||!token)throw Error(auth.error||'Login failed');const approve=await fetch(root+'/api/v1/auth/device/approve',{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer '+token},body:JSON.stringify({code})});if(!approve.ok)throw Error('Code expired or invalid');form.remove();message.textContent='TV connected. You can close this page.'}catch(error){message.textContent=error.message||'Could not connect TV'}}</script>`
+  const html = `<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connect Fluxa TV</title><style>body{font:16px system-ui;background:#101010;color:#fff;max-width:420px;margin:10vh auto;padding:24px}input,button{box-sizing:border-box;width:100%;padding:14px;margin:6px 0;border-radius:8px;border:1px solid #555;background:#191919;color:#fff}button{background:#fff;color:#111;font-weight:700}#message{margin-top:16px}</style><h1>Connect Fluxa TV</h1><p>Enter your Fluxa account to connect this TV.</p><form id="form"><input id="email" type="email" autocomplete="email" placeholder="Email" required><input id="password" type="password" autocomplete="current-password" placeholder="Password" required><button>Connect TV</button></form><div id="message"></div><script>const code=${safeCode},root=${JSON.stringify(apiRoot)};const message=document.querySelector('#message');document.querySelector('#form').addEventListener('submit',async event=>{event.preventDefault();message.textContent='Connecting…';try{const login=await fetch(root+'/api/v1/auth/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:email.value,password:password.value})});const auth=await login.json();const token=auth.access_token;if(!login.ok||!token)throw Error(auth.error||'Login failed');const approve=await fetch(root+'/api/v1/auth/device/approve',{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer '+token},body:JSON.stringify({code})});if(!approve.ok)throw Error('Code expired or invalid');form.remove();message.textContent='TV connected. You can close this page.'}catch(error){message.textContent=error.message||'Could not connect TV'}}</script>`
   return new Response(html, { status: 200, headers: { ...cors, 'content-type': 'text/html; charset=utf-8' } })
 }
 
@@ -435,17 +435,20 @@ async function deviceAuth(request: Request, action: string) {
   if (new Date(session.data.expires_at).getTime() <= Date.now()) return response({ status: 'expired' })
   if (action !== 'exchange' || !session.data.approved_user_id) return response({ status: 'pending' })
 
+  const claimed = await db.from('device_login_sessions').update({ consumed_at: new Date().toISOString() }).eq('id', sessionId).is('consumed_at', null).select('id')
+  if (claimed.error) return response({ error: 'database error' }, 500)
+  if (!claimed.data?.length) return response({ error: 'device session already consumed' }, 400)
+  const release = () => db.from('device_login_sessions').update({ consumed_at: null }).eq('id', sessionId)
+
   const account = await db.auth.admin.getUserById(session.data.approved_user_id)
   const email = account.data.user?.email
-  if (account.error || !email) return response({ error: 'account unavailable' }, 500)
+  if (account.error || !email) { await release(); return response({ error: 'account unavailable' }, 500) }
   const link = await db.auth.admin.generateLink({ type: 'magiclink', email })
   const properties = link.data?.properties as Record<string, unknown> | undefined
   const tokenHash = properties?.hashed_token
-  if (link.error || typeof tokenHash !== 'string') return response({ error: 'could not create device session' }, 500)
+  if (link.error || typeof tokenHash !== 'string') { await release(); return response({ error: 'could not create device session' }, 500) }
   const verified = await authClient.auth.verifyOtp({ type: 'magiclink', token_hash: tokenHash })
-  if (verified.error || !verified.data.session) return response({ error: 'could not create device session' }, 500)
-  const consumed = await db.from('device_login_sessions').update({ consumed_at: new Date().toISOString() }).eq('id', sessionId).is('consumed_at', null)
-  if (consumed.error) return response({ error: 'database error' }, 500)
+  if (verified.error || !verified.data.session) { await release(); return response({ error: 'could not create device session' }, 500) }
   return response({ status: 'authorized', ...sessionBody(verified.data) })
 }
 

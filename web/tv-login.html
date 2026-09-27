@@ -1,0 +1,46 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="fluxa-api" content="https://YOUR-PROJECT.supabase.co/functions/v1/fluxa-sync">
+<title>Connect Fluxa TV</title>
+<style>
+body{font:16px system-ui;background:#101010;color:#fff;max-width:420px;margin:10vh auto;padding:24px}
+input,button{box-sizing:border-box;width:100%;padding:14px;margin:6px 0;border-radius:8px;border:1px solid #555;background:#191919;color:#fff}
+button{background:#fff;color:#111;font-weight:700}
+#message{margin-top:16px}
+</style>
+</head>
+<body>
+<h1>Connect Fluxa TV</h1>
+<p>Enter your Fluxa account to connect this TV.</p>
+<form id="form">
+<input id="email" type="email" autocomplete="email" placeholder="Email" required>
+<input id="password" type="password" autocomplete="current-password" placeholder="Password" required>
+<button>Connect TV</button>
+</form>
+<div id="message"></div>
+<script>
+const root = document.querySelector('meta[name="fluxa-api"]').content.replace(/\/$/, '')
+const code = (new URLSearchParams(location.search).get('code') || '').trim().toUpperCase()
+const form = document.querySelector('#form')
+const message = document.querySelector('#message')
+form.addEventListener('submit', async event => {
+  event.preventDefault()
+  message.textContent = 'Connecting…'
+  try {
+    const login = await fetch(root + '/api/v1/auth/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: email.value, password: password.value }) })
+    const auth = await login.json().catch(() => ({}))
+    if (!login.ok || !auth.access_token) throw Error(auth.error || 'Invalid email or password')
+    const approve = await fetch(root + '/api/v1/auth/device/approve', { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + auth.access_token }, body: JSON.stringify({ code }) })
+    if (!approve.ok) throw Error('Code expired or invalid')
+    form.remove()
+    message.textContent = 'TV connected. You can close this page.'
+  } catch (error) {
+    message.textContent = error.message || 'Could not connect TV'
+  }
+})
+</script>
+</body>
+</html>

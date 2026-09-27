@@ -99,7 +99,7 @@ Both deployment modes fit the free tier if a few things are set correctly:
 - **Edge function invocations**: `sync/push` reads every document a request touches in one query rather than one round trip per change, and batches distinct keys concurrently, which keeps large pushes well under the function's wall-time budget. Access tokens are resolved against Supabase Auth at most once a minute per token instead of once per request. The standalone server collapses a push into two multi-row inserts regardless of how many changes it carries.
 - **Egress (5GB/month)**: `sync/pull` returns at most 2000 events per call and sets `has_more` when it truncates, moving the cursor to the last event it returned. `sync/snapshot` no longer downloads generic documents for entities the typed tables already mirror.
 
-Set `PUBLIC_BASE_URL` to the HTTPS public API origin in production so QR codes open the correct approval page. `DEVICE_LOGIN_URL` can override the generated `/tv-login?code=...` URL when a separate web frontend is deployed. `DEVICE_REQUESTS_PER_MINUTE` controls the TV polling budget and defaults to 120.
+Set `PUBLIC_BASE_URL` to the HTTPS public API origin in production so QR codes open the correct approval page. `DEVICE_LOGIN_URL` can override the generated `/tv-login?code=...` URL when a separate web frontend is deployed. On a default `*.supabase.co` domain, edge functions serve HTML as plain text, so host `web/tv-login.html` on any static host (GitHub Pages, Cloudflare Pages), set its `fluxa-api` meta tag to the function URL, and point `DEVICE_LOGIN_URL` at it. `DEVICE_REQUESTS_PER_MINUTE` controls the TV polling budget and defaults to 120.
 
 ## Backups
 

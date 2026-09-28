@@ -43,6 +43,12 @@ function deviceLoginPage(request: Request) {
   return new Response(html, { status: 200, headers: { ...cors, 'content-type': 'text/html; charset=utf-8' } })
 }
 
+function discovery(request: Request) {
+  const url = new URL(request.url)
+  const apiBase = (Deno.env.get('PUBLIC_BASE_URL') ?? `${url.origin}${url.pathname.replace(/\/\.well-known\/fluxa\/?$/, '')}`).replace(/\/$/, '')
+  return response({ name: 'fluxa-sync', backend: 'supabase', api_base: apiBase, device_login: { login_url: deviceLoginUrl('').replace(/[?&]code=$/, '') }, max_pull_changes: maxPullChanges })
+}
+
 function sensitivePath(value: unknown, path = 'payload'): string | null {
   if (Array.isArray(value)) {
     for (let index = 0; index < value.length; index += 1) {
@@ -420,27 +426,23 @@ async function deviceAuth(request: Request, action: string) {
     const body = await request.json().catch(() => ({}))
     const code = typeof body.code === 'string' ? body.code.trim().toUpperCase() : ''
     if (!/^[A-Z0-9]{8}$/.test(code)) return response({ error: 'invalid device code' }, 400)
-    const result = await db.from('device_login_sessions').update({ approved_user_id: current.id, approved_at: new Date().toISOString() })
+    const result = await db.from('device_login_sessions').update({ approved_user_id: current.id, approved_at: new Date().toISOString() }, { count: 'exact' })
       .eq('code_hash', await sha256Hex(code)).is('approved_user_id', null).is('consumed_at', null).gt('expires_at', new Date().toISOString())
-      .select('id', { count: 'exact', head: true })
     return result.error ? response({ error: 'database error' }, 500) : new Response(null, { status: result.count === 0 ? 400 : 204, headers: cors })
   }
 
+  if (action !== 'exchange' || request.method !== 'POST') return response({ error: 'not found' }, 404)
   const body = await request.json().catch(() => ({}))
   const sessionId = typeof body.session_id === 'string' ? body.session_id : ''
   const pollSecret = typeof body.poll_secret === 'string' ? body.poll_secret : ''
-  const session = await db.from('device_login_sessions').select('approved_user_id,expires_at,consumed_at').eq('id', sessionId).eq('poll_secret_hash', await sha256Hex(pollSecret)).maybeSingle()
-  if (session.error || !session.data) return response({ error: 'unauthorized' }, 401)
-  if (session.data.consumed_at) return response({ error: 'device session already consumed' }, 400)
-  if (new Date(session.data.expires_at).getTime() <= Date.now()) return response({ status: 'expired' })
-  if (action !== 'exchange' || !session.data.approved_user_id) return response({ status: 'pending' })
-
-  const claimed = await db.from('device_login_sessions').update({ consumed_at: new Date().toISOString() }).eq('id', sessionId).is('consumed_at', null).select('id')
-  if (claimed.error) return response({ error: 'database error' }, 500)
-  if (!claimed.data?.length) return response({ error: 'device session already consumed' }, 400)
+  const claim = await db.rpc('claim_device_login', { p_session_id: sessionId, p_poll_secret_hash: await sha256Hex(pollSecret) })
+  const claimed = claim.data?.[0]
+  if (claim.error || !claimed) return response({ error: 'unauthorized' }, 401)
+  if (claimed.status === 'consumed') return response({ error: 'device session already consumed' }, 400)
+  if (claimed.status !== 'claimed') return response({ status: claimed.status })
   const release = () => db.from('device_login_sessions').update({ consumed_at: null }).eq('id', sessionId)
 
-  const account = await db.auth.admin.getUserById(session.data.approved_user_id)
+  const account = await db.auth.admin.getUserById(claimed.user_id)
   const email = account.data.user?.email
   if (account.error || !email) { await release(); return response({ error: 'account unavailable' }, 500) }
   const link = await db.auth.admin.generateLink({ type: 'magiclink', email })
@@ -679,6 +681,7 @@ Deno.serve(async (request) => {
   const url = new URL(request.url)
   const parts = url.pathname.split('/').filter(Boolean)
   try {
+    if (parts.at(-2) === '.well-known' && parts.at(-1) === 'fluxa' && request.method === 'GET') return discovery(request)
     if (parts.at(-1) === 'tv-login' && request.method === 'GET') return deviceLoginPage(request)
     if (parts.at(-2) === 'auth') {
       const result = await auth(request, parts.at(-1)!)

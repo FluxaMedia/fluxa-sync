@@ -12,6 +12,7 @@ POST /api/v1/auth/device/start
 POST /api/v1/auth/device/approve
 POST /api/v1/auth/device/exchange
 GET  /tv-login?code=<user_code>
+GET  /.well-known/fluxa
 GET  /api/v1/profiles
 POST /api/v1/profiles
 PATCH /api/v1/profiles/:profile_id

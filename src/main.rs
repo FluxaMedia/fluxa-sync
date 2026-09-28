@@ -425,6 +425,13 @@ async fn throttle_device(State(state): State<AppState>, ConnectInfo(peer): Conne
     next.run(request).await
 }
 
+async fn discovery() -> Json<Value> {
+    let api_base = env::var("PUBLIC_BASE_URL").unwrap_or_else(|_| "http://localhost:8080".into()).trim_end_matches('/').to_string();
+    let login_url = device_login_url("");
+    let login_url = login_url.trim_end_matches("code=").trim_end_matches(['?', '&']);
+    Json(json!({"name": "fluxa-sync", "backend": "standalone", "version": env!("CARGO_PKG_VERSION"), "api_base": api_base, "device_login": {"login_url": login_url}, "max_pull_changes": MAX_PULL_CHANGES}))
+}
+
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let database = if sqlx::query("select 1").execute(&state.db).await.is_ok() { "ok" } else { "error" };
     (StatusCode::OK, Json(Health { status: "ok", database }))
@@ -786,6 +793,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(middleware::from_fn_with_state(state.clone(), throttle_device));
     let app = Router::new()
         .route("/health", get(health))
+        .route("/.well-known/fluxa", get(discovery))
         .route("/tv-login", get(device_login_page))
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/me", get(me))

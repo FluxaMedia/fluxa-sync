@@ -338,7 +338,7 @@ async function user(request: Request) {
   const cached = userCache.get(token)
   if (cached && cached.expiresAt > Date.now()) return cached.account
   const result = await authClient.auth.getUser(token)
-  const account = result.data.user ?? null
+  const account = result.data.user && !result.data.user.is_anonymous ? result.data.user : null
   if (account) {
     if (userCache.size > 500) userCache.clear()
     userCache.set(token, { account, expiresAt: Date.now() + 60_000 })
